@@ -12,7 +12,8 @@
     "css": "node node_modules/tailwindcss/lib/cli.js -c tailwind.config.js -i src-css/input.css -o styles.css --minify",
     "vendor": "node scripts/vendor.mjs",
     "check": "node scripts/check.mjs",
-    "verify": "node scripts/build.mjs && node scripts/check.mjs && node scripts/verify-render.mjs"
+    "inspect-prompts": "node scripts/inspect-prompts.mjs",
+    "verify": "node scripts/build.mjs && node scripts/check.mjs && node scripts/verify-render.mjs && node scripts/inspect-prompts.mjs"
   },
   "dependencies": {
     "react": "^18.3.1",

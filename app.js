@@ -1,6 +1,6 @@
 /* 本文件由 scripts/build.mjs 从 app.jsx 自动生成，请勿直接修改。
  * 改代码请改 app.jsx，然后运行：node scripts/build.mjs
- * 生成时间：2026/9/17 23:46:18
+ * 生成时间：2026/9/17 23:48:39
  */
 /* ============================================================================
  * 考公做题分析器 —— 免构建单文件应用
@@ -626,34 +626,46 @@ function packsForSubject(subject) {
  *
  * 为什么要压：完整包 8-12KB，全塞进去每次分析都多花不少 token，还可能干扰模型。
  * 这里只取「指令 + 骨干方法」，示例和长篇说明留给人工查阅。
+ *
+ * 排版要求（踩过坑）：以「小节」为数组单位，段内用单换行、段间用双换行。
+ * 早先的写法是每条规则 push 一个数组元素，结果渲染出来每条之间都夹一个空行，
+ * 2000 多字里大量篇幅浪费在空行上，结构也松散、容易被模型忽略。
  */
 function packToPromptText(pack, opts = {}) {
   if (!pack) return '';
   const {
     maxChars = 2800
   } = opts;
-  const lines = [];
-  if (pack.promptFragment) lines.push('【本流派的批改要求】\n' + pack.promptFragment);
-  if (pack.honestyNote?.text) lines.push('【关于标准的性质，必须如实转述】\n' + pack.honestyNote.text);
-  if (pack.evidenceDiscipline?.rule) lines.push('【证据分级纪律】\n' + pack.evidenceDiscipline.rule);
-  if (Array.isArray(pack.methods)) {
-    lines.push('【本流派的方法清单与判定规则】');
-    pack.methods.forEach(m => {
+  const sections = [];
+  if (pack.promptFragment) sections.push('【本流派的批改要求】\n' + pack.promptFragment);
+  if (pack.honestyNote?.text) {
+    sections.push('【关于标准的性质，必须如实转述】\n' + pack.honestyNote.text);
+  }
+  if (pack.evidenceDiscipline?.rule) {
+    sections.push('【证据分级纪律】\n' + pack.evidenceDiscipline.rule);
+  }
+
+  // 资料分析类：每个方法一段，段内紧凑
+  if (Array.isArray(pack.methods) && pack.methods.length) {
+    const body = pack.methods.map(m => {
       const parts = [`▸ ${m.name}（${m.when || ''}）`];
       if (m.principle) parts.push('原理：' + m.principle);
       if (m.formula) parts.push('公式：' + m.formula);
       if (Array.isArray(m.decisionRules)) {
         m.decisionRules.forEach(r => {
-          parts.push(`  · 当${r.when} → ${r.action}${r.example ? '（例：' + r.example + '）' : ''}`);
+          parts.push(`· 当${r.when} → ${r.action}${r.example ? '（例：' + r.example + '）' : ''}`);
         });
       }
       if (Array.isArray(m.steps)) parts.push('步骤：' + m.steps.join(' → '));
       if (Array.isArray(m.traps)) parts.push('易错：' + m.traps.join('；'));
-      lines.push(parts.join('\n'));
-    });
+      return parts.join('\n');
+    }).join('\n\n');
+    sections.push('【本流派的方法清单与判定规则】\n' + body);
   }
-  if (pack.shenTiSiYaoSu?.elements) {
-    lines.push('【审题：题干四要素】');
+
+  // 申论类：审题四要素
+  if (Array.isArray(pack.shenTiSiYaoSu?.elements)) {
+    const lines = [];
     pack.shenTiSiYaoSu.elements.forEach(el => {
       if (Array.isArray(el.rules)) {
         el.rules.forEach(r => {
@@ -663,51 +675,65 @@ function packToPromptText(pack, opts = {}) {
       if (Array.isArray(el.regular)) el.regular.forEach(r => lines.push(`· ${r.word}：${r.meaning}`));
       if (Array.isArray(el.processing)) el.processing.forEach(r => lines.push(`· ${r.word}：${r.meaning}`));
     });
+    if (lines.length) sections.push('【审题：题干四要素】\n' + lines.join('\n'));
   }
   if (Array.isArray(pack.keywordReading?.signals)) {
-    lines.push('【读材料：8 类信号词】');
-    pack.keywordReading.signals.forEach(s => lines.push(`· ${s.type}（${s.markers}）→ ${s.use}`));
+    sections.push('【读材料：8 类信号词】\n' + pack.keywordReading.signals.map(s => `· ${s.type}（${s.markers}）→ ${s.use}`).join('\n'));
   }
   if (Array.isArray(pack.logicReading?.relations)) {
-    lines.push('【逻辑阅读】');
-    pack.logicReading.relations.forEach(r => lines.push(`· ${r.type}：${r.principle || r.note || ''}`));
+    sections.push('【逻辑阅读】\n' + pack.logicReading.relations.map(r => `· ${r.type}：${r.principle || r.note || ''}`).join('\n'));
   }
   if (Array.isArray(pack.qianZhiTiLian?.rules)) {
-    lines.push('【前置提炼】\n' + pack.qianZhiTiLian.rules.slice(0, 5).map(r => '· ' + r).join('\n'));
+    sections.push('【前置提炼】\n' + pack.qianZhiTiLian.rules.slice(0, 5).map(r => '· ' + r).join('\n'));
+  }
+  if (pack.qianZhiTiLian?.sentenceFormula) {
+    sections.push('【要点句子公式】\n' + pack.qianZhiTiLian.sentenceFormula);
   }
   if (Array.isArray(pack.answerIronRules?.rules)) {
-    lines.push('【作答铁律】\n' + pack.answerIronRules.rules.map(r => `· ${r.name}：${r.detail}`).join('\n'));
+    sections.push('【作答铁律】\n' + pack.answerIronRules.rules.map(r => `· ${r.name}：${r.detail}`).join('\n'));
   }
   if (Array.isArray(pack.structuralRules?.rules)) {
-    lines.push('【总括句规则】\n' + pack.structuralRules.rules.map(r => '· ' + r).join('\n'));
+    sections.push('【总括句规则】\n' + pack.structuralRules.rules.map(r => '· ' + r).join('\n'));
   }
   if (Array.isArray(pack.scoring?.method)) {
-    lines.push('【判分方法：采分点覆盖法】\n' + pack.scoring.method.map(s => '· ' + s).join('\n'));
+    sections.push('【判分方法：采分点覆盖法】\n' + pack.scoring.method.map(s => '· ' + s).join('\n'));
+  }
+  if (Array.isArray(pack.scoring?.notDeductions)) {
+    sections.push('【不算扣分点（别乱扣）】\n' + pack.scoring.notDeductions.map(s => '· ' + s).join('\n'));
   }
   if (pack.unverifiedWarnings?.rule) {
-    lines.push('【不得用作扣分理由的说法】\n' + pack.unverifiedWarnings.rule);
-    (pack.unverifiedWarnings.items || []).forEach(i => lines.push(`· 禁用：${i.claim}`));
+    const items = (pack.unverifiedWarnings.items || []).map(i => `· 禁用：${i.claim}`).join('\n');
+    sections.push('【不得用作扣分理由的说法】\n' + pack.unverifiedWarnings.rule + (items ? '\n' + items : ''));
   }
-  if (pack.bigEssay?.grades) {
-    lines.push('【大作文分档】');
-    pack.bigEssay.grades.forEach(g => lines.push(`· ${g.grade} ${g.range} 分：${g.standard}`));
+
+  // 国考评分标准
+  if (Array.isArray(pack.bigEssay?.grades)) {
+    sections.push('【大作文分档（先定档，后扣分）】\n' + pack.bigEssay.grades.map(g => {
+      // range 可能是 "31-40" 或 "10 及以下"，统一成自然的读法
+      const r = /^\d+(-\d+)?$/.test(String(g.range)) ? `${g.range} 分` : String(g.range);
+      return `· ${g.grade}：${r} —— ${g.standard}`;
+    }).join('\n'));
   }
   if (Array.isArray(pack.bigEssay?.dimensions)) {
-    lines.push('【五维权重】');
-    pack.bigEssay.dimensions.forEach(d => lines.push(`· ${d.name} ${d.weight}% —— ${d.note}`));
+    sections.push('【五维权重】\n' + pack.bigEssay.dimensions.map(d => `· ${d.name} ${d.weight}% —— ${d.note}`).join('\n'));
   }
   if (Array.isArray(pack.bigEssay?.fatalDeductions)) {
-    lines.push('【致命失分项】');
-    pack.bigEssay.fatalDeductions.forEach(f => lines.push(`· ${f.item}：${f.rule}`));
+    sections.push('【致命失分项】\n' + pack.bigEssay.fatalDeductions.map(f => `· ${f.item}：${f.rule}`).join('\n'));
+  }
+  if (pack.bigEssay?.noQuestionMode?.mustConvertScore) {
+    sections.push('【分数换算纪律】\n' + pack.bigEssay.noQuestionMode.mustConvertScore);
   }
   if (Array.isArray(pack.smallQuestions?.rules)) {
-    lines.push('【小题评分】\n' + pack.smallQuestions.rules.map(r => `· ${r.item}：${r.detail}`).join('\n'));
+    sections.push('【小题评分】\n' + pack.smallQuestions.rules.map(r => `· ${r.item}：${r.detail}`).join('\n'));
   }
   if (Array.isArray(pack.expressionAndPaper?.rules)) {
-    lines.push('【卷面与表达】\n' + pack.expressionAndPaper.rules.slice(0, 4).map(r => '· ' + r).join('\n'));
+    sections.push('【卷面与表达】\n' + pack.expressionAndPaper.rules.slice(0, 4).map(r => '· ' + r).join('\n'));
   }
-  let text = lines.join('\n\n');
-  if (text.length > maxChars) text = text.slice(0, maxChars) + '\n…（内容较长已截断）';
+  let text = sections.join('\n\n');
+  if (text.length > maxChars) {
+    // 截断是有代价的：后半段规则会丢。所以要能看见（inspect-prompts.mjs 会报出来）
+    text = text.slice(0, maxChars) + '\n…（内容较长已截断）';
+  }
   return text;
 }
 

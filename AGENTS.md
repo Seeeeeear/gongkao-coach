@@ -44,6 +44,7 @@ cloudflare-worker.example.js  可选的 Key 代理（公开给别人用时才需
 scripts/build.mjs        app.jsx → app.js（npm run build / watch）
 scripts/check.mjs        语法校验
 scripts/verify-render.mjs jsdom 真实渲染验证（改完必跑）
+scripts/inspect-prompts.mjs 检查技能包注入的提示词（长度/截断/空行/关键规则）
 scripts/vendor.mjs       复制 React 到 vendor/
 scripts/fetch-skills.mjs 抓第三方 skill 原始文档到 vendor-skills/（已 gitignore）
 skills/index.json        技能包索引（仅供参考，实际索引内联在 app.jsx）
@@ -72,11 +73,18 @@ server.mjs               零依赖静态服务器
   那些分档是培训行业归纳的惯例。批改时必须如实说明，不得冒充官方标准。
 - `packToPromptText(pack)` 负责把包压成提示词片段（默认截到 2800 字）。
   包变大时要调整压缩逻辑，不要整包塞进 prompt。
+- **排版规则（踩过坑）**：`packToPromptText` 以「小节」为数组单位，
+  段内用单换行、段间用双换行。
+  **不要每条规则 push 一个数组元素** —— 那样 `join('\n\n')` 会在每条之间插空行，
+  2000 字提示词里大量篇幅浪费在空行上，结构松散还容易被模型忽略。
+- 改完技能包或压缩逻辑，跑 `npm run inspect-prompts` 看真实注入的文本：
+  它会检查**是否被截断**（截断会丢规则）、**空行是否过多**、关键规则是否都在。
 
 ## 改动流程（务必遵守）
 1. 只改 `app.jsx`（或 `src-css/input.css`、`tailwind.config.js`）
-2. 跑 `npm run verify` —— 它会编译、校验语法、并用 jsdom + fake-indexeddb 真实渲染一遍
-   （逐个点开 5 个 tab、点示例分析、验证自动留档/收藏/双视图计数/IndexedDB 落盘）
+2. 跑 `npm run verify` —— 它会编译、校验语法、用 jsdom + fake-indexeddb 真实渲染一遍
+   （逐个点开 5 个 tab、点示例分析、验证自动留档/收藏/双视图计数/IndexedDB 落盘），
+   最后检查技能包注入的提示词（长度/截断/空行/关键规则）
 3. 改了 Tailwind 类或配置，再跑 `npm run css`
 4. **改了 app.js / styles.css 后必须把 `sw.js` 里的 `VERSION` 加一**，
    否则手机上一直加载旧缓存，你会以为改动没生效
