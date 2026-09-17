@@ -1,6 +1,6 @@
 /* 本文件由 scripts/build.mjs 从 app.jsx 自动生成，请勿直接修改。
  * 改代码请改 app.jsx，然后运行：node scripts/build.mjs
- * 生成时间：2026/9/17 21:10:41
+ * 生成时间：2026/9/17 22:21:59
  */
 /* ============================================================================
  * 考公做题分析器 —— 免构建单文件应用
@@ -274,12 +274,27 @@ const BUILTIN_TIPS = [{
 }];
 
 /* ==========================================================================
- * §3 本地存储 —— 全部存在浏览器，不上云
+ * §3 存储层 —— IndexedDB
+ *
+ * 为什么用 IndexedDB 而不是 localStorage：
+ *   1. localStorage 只有 5MB，且是同步 API，写的时候会卡住界面
+ *   2. 现在每分析一道题都会留一条记录（哪怕没加入错题本），数据量上去了
+ *   3. IndexedDB 异步、手机端配额通常几百 MB，容量焦虑彻底消失
+ *
+ * 两个 store：
+ *   settings → 一条记录装全部设置 + 自定义技巧
+ *   records  → 每条分析一条
  * ========================================================================*/
 
-const K_SETTINGS = 'gk_settings_v1';
-const K_RECORDS = 'gk_records_v1';
-const K_TIPS = 'gk_tips_v1';
+const DB_NAME = 'gongkao_coach';
+const DB_VERSION = 1;
+const STORE_SETTINGS = 'settings';
+const STORE_RECORDS = 'records';
+
+// 旧版 localStorage 的键，仅用于一次性迁移
+const K_OLD_SETTINGS = 'gk_settings_v1';
+const K_OLD_RECORDS = 'gk_records_v1';
+const K_OLD_TIPS = 'gk_tips_v1';
 const DEFAULT_SETTINGS = {
   apiKey: '',
   baseUrl: 'https://api.deepseek.com',
@@ -315,20 +330,118 @@ const VISION_PRESETS = [{
   baseUrl: '',
   model: ''
 }];
-function lsGet(key, fallback) {
-  try {
-    const raw = localStorage.getItem(key);
-    return raw ? JSON.parse(raw) : fallback;
-  } catch {
-    return fallback;
+let dbPromise = null;
+function openDB() {
+  if (typeof indexedDB === 'undefined') {
+    return Promise.reject(new Error('这个浏览器不支持 IndexedDB'));
   }
+  if (dbPromise) return dbPromise;
+  dbPromise = new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(STORE_SETTINGS)) {
+        db.createObjectStore(STORE_SETTINGS);
+      }
+      if (!db.objectStoreNames.contains(STORE_RECORDS)) {
+        const store = db.createObjectStore(STORE_RECORDS, {
+          keyPath: 'id'
+        });
+        store.createIndex('updatedAt', 'updatedAt');
+        store.createIndex('createdAt', 'createdAt');
+        store.createIndex('saved', 'saved');
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error || new Error('打开数据库失败'));
+  });
+  return dbPromise;
 }
-function lsSet(key, value) {
-  try {
-    localStorage.setItem(key, JSON.stringify(value));
-  } catch (e) {
-    console.warn('本地存储写入失败（可能已满）', e);
+
+/** 统一的事务包装：run(store) 的返回值里若带 __req，就等请求结果 */
+function tx(storeName, mode, run) {
+  return openDB().then(db => new Promise((resolve, reject) => {
+    const t = db.transaction(storeName, mode);
+    const store = t.objectStore(storeName);
+    let result;
+    try {
+      result = run(store);
+    } catch (e) {
+      reject(e);
+      return;
+    }
+    t.oncomplete = () => resolve(result && result.__req ? result.__req.result : result);
+    t.onerror = () => reject(t.error || new Error('数据库操作失败'));
+    t.onabort = () => reject(t.error || new Error('数据库操作被中断'));
+  }));
+}
+const dbGetSettings = () => tx(STORE_SETTINGS, 'readonly', s => {
+  const req = s.get('app');
+  return {
+    __req: req
+  };
+}).catch(() => null);
+const dbSaveSettings = settings => tx(STORE_SETTINGS, 'readwrite', s => s.put(settings, 'app')).catch(e => console.warn('保存设置失败', e));
+const dbGetCustomTips = () => tx(STORE_SETTINGS, 'readonly', s => {
+  const req = s.get('customTips');
+  return {
+    __req: req
+  };
+}).catch(() => []);
+const dbSaveCustomTips = tips => tx(STORE_SETTINGS, 'readwrite', s => s.put(tips, 'customTips')).catch(e => console.warn('保存自定义技巧失败', e));
+const dbGetRecords = () => tx(STORE_RECORDS, 'readonly', s => {
+  const req = s.getAll();
+  return {
+    __req: req
+  };
+}).catch(() => []);
+const dbPutRecord = record => tx(STORE_RECORDS, 'readwrite', s => s.put(record));
+const dbPutRecords = records => tx(STORE_RECORDS, 'readwrite', s => {
+  records.forEach(r => s.put(r));
+  return records.length;
+});
+const dbDeleteRecord = id => tx(STORE_RECORDS, 'readwrite', s => s.delete(id));
+const dbClearRecords = () => tx(STORE_RECORDS, 'readwrite', s => s.clear());
+
+/**
+ * 把旧版 localStorage 里的数据搬进 IndexedDB，只跑一次，搬完清掉旧键。
+ * 老记录没有 saved 字段，一律当作「已加入错题本」。
+ */
+async function migrateFromLocalStorage() {
+  if (typeof localStorage === 'undefined') return 0;
+  const readOld = (key, fallback) => {
+    try {
+      const raw = localStorage.getItem(key);
+      return raw ? JSON.parse(raw) : fallback;
+    } catch {
+      return fallback;
+    }
+  };
+  const oldRecords = readOld(K_OLD_RECORDS, []);
+  const oldSettings = readOld(K_OLD_SETTINGS, null);
+  const oldTips = readOld(K_OLD_TIPS, []);
+  let migrated = 0;
+  if (Array.isArray(oldRecords) && oldRecords.length) {
+    const normalized = oldRecords.map(r => ({
+      saved: true,
+      source: r.source || 'migrated',
+      createdAt: r.createdAt || Date.now(),
+      updatedAt: r.createdAt || Date.now(),
+      ...r
+    }));
+    await dbPutRecords(normalized);
+    migrated = normalized.length;
   }
+  if (oldSettings) await dbSaveSettings(oldSettings);
+  if (Array.isArray(oldTips) && oldTips.length) await dbSaveCustomTips(oldTips);
+  try {
+    localStorage.removeItem(K_OLD_RECORDS);
+    localStorage.removeItem(K_OLD_SETTINGS);
+    localStorage.removeItem(K_OLD_TIPS);
+  } catch {
+    // 清不掉也不影响使用
+  }
+  return migrated;
 }
 function computeStats(records) {
   const total = records.length;
@@ -956,12 +1069,22 @@ function PrimaryButton({
   onClick,
   disabled,
   className = '',
-  loading
+  loading,
+  done,
+  doneText
 }) {
+  // done：刚完成的操作，显示对勾给一个确定的收尾反馈
+  if (done) {
+    return /*#__PURE__*/React.createElement("div", {
+      className: 'gk-pop inline-flex w-full items-center justify-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 font-semibold text-emerald-700 ' + className
+    }, /*#__PURE__*/React.createElement("span", {
+      className: "text-lg leading-none"
+    }, "\u2713"), doneText || '已完成');
+  }
   return /*#__PURE__*/React.createElement("button", {
     onClick: onClick,
     disabled: disabled || loading,
-    className: 'inline-flex w-full items-center justify-center gap-2 rounded-xl bg-brand-600 px-4 py-3 font-semibold text-white transition active:scale-[0.99] disabled:opacity-50 ' + className
+    className: 'relative inline-flex w-full items-center justify-center gap-2 rounded-xl bg-brand-600 px-4 py-3 font-semibold text-white transition disabled:bg-slate-300 disabled:text-slate-500 ' + className
   }, loading && /*#__PURE__*/React.createElement("span", {
     className: "h-4 w-4 animate-spin rounded-full border-2 border-white/40 border-t-white"
   }), children);
@@ -1187,7 +1310,9 @@ function CapturePage({
 }) {
   const {
     settings,
-    create
+    create,
+    patch,
+    showToast
   } = useApp();
   const [mode, setMode] = useState('photo');
   const [image, setImage] = useState(null);
@@ -1200,6 +1325,8 @@ function CapturePage({
   const [err, setErr] = useState('');
   const [analysis, setAnalysis] = useState(null);
   const [savedId, setSavedId] = useState(null);
+  // 分析完自动留档产生的那条记录 id（加入错题本时复用它，避免重复入库）
+  const [draftId, setDraftId] = useState(null);
   const fileRef = useRef(null);
   const onPickFile = async e => {
     const file = e.target.files?.[0];
@@ -1230,26 +1357,55 @@ function CapturePage({
       });
       if (!a.module) a.module = module;
       setAnalysis(a);
+
+      // 分析完立刻留档（saved: false 表示「只是分析过，还没加入错题本」）。
+      // 这样即使用户看完就走，历史里也有痕迹，不会什么都留不下。
+      const archived = create({
+        module: a.module || module,
+        topic: a.topic || '',
+        questionText: a.question_text || questionText,
+        userAnswer: a.user_answer || userAnswer,
+        correctAnswer: a.correct_answer || correctAnswer,
+        status: a.is_correct ? 'correct' : 'wrong',
+        analysis: a,
+        source: mode === 'photo' ? 'photo' : 'text',
+        userNote,
+        saved: false
+      });
+      setDraftId(archived.id);
     } catch (e) {
       setErr(e.message);
     } finally {
       setLoading(false);
     }
-  }, [settings, mode, image, questionText, module, userAnswer, correctAnswer, userNote]);
+  }, [settings, mode, image, questionText, module, userAnswer, correctAnswer, userNote, create]);
+
+  /** 加入错题本：把已经留档的那条改成 saved，而不是又插一条新的 */
   const save = () => {
     if (!analysis) return;
-    const rec = create({
-      module: analysis.module || module,
-      topic: analysis.topic || '',
-      questionText: analysis.question_text || questionText,
-      userAnswer: analysis.user_answer || userAnswer,
-      correctAnswer: analysis.correct_answer || correctAnswer,
-      status: analysis.is_correct ? 'correct' : 'wrong',
-      analysis,
-      source: mode === 'photo' ? 'photo' : 'text',
-      userNote
-    });
-    setSavedId(rec.id);
+    if (draftId) {
+      patch(draftId, {
+        saved: true
+      });
+      setSavedId(draftId);
+      showToast('已加入错题本，弱点报告会统计这道题');
+    } else {
+      // 兜底：万一留档失败（比如 IndexedDB 不可用），这里再补一条
+      const rec = create({
+        module: analysis.module || module,
+        topic: analysis.topic || '',
+        questionText: analysis.question_text || questionText,
+        userAnswer: analysis.user_answer || userAnswer,
+        correctAnswer: analysis.correct_answer || correctAnswer,
+        status: analysis.is_correct ? 'correct' : 'wrong',
+        analysis,
+        source: mode === 'photo' ? 'photo' : 'text',
+        userNote,
+        saved: true
+      });
+      setSavedId(rec.id);
+      showToast('已加入错题本');
+    }
   };
   const reset = () => {
     setImage(null);
@@ -1259,6 +1415,7 @@ function CapturePage({
     setUserNote('');
     setAnalysis(null);
     setSavedId(null);
+    setDraftId(null);
     setErr('');
     if (fileRef.current) fileRef.current.value = '';
   };
@@ -1377,7 +1534,9 @@ function CapturePage({
     className: "w-full rounded-xl border border-slate-200 bg-white py-2.5 text-sm font-medium text-slate-500"
   }, "\u8FD8\u6CA1\u914D API Key\uFF1F\u5148\u770B\u4E00\u4EFD\u793A\u4F8B\u5206\u6790 \u2192"), loading && /*#__PURE__*/React.createElement("div", {
     className: "text-center text-xs text-slate-400"
-  }, "\u62CD\u7167\u8BC6\u522B\u901A\u5E38 5-15 \u79D2\uFF0C\u8BF7\u7A0D\u7B49"), analysis && /*#__PURE__*/React.createElement("div", {
+  }, "\u62CD\u7167\u8BC6\u522B\u901A\u5E38 5-15 \u79D2\uFF0C\u8BF7\u7A0D\u7B49"), !loading && draftId && !savedId && /*#__PURE__*/React.createElement("div", {
+    className: "gk-fade-in rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-800"
+  }, "\u2713 \u5206\u6790\u5B8C\u6210\uFF0C", /*#__PURE__*/React.createElement("b", null, "\u5DF2\u81EA\u52A8\u7559\u6863\u5230\u300C\u6700\u8FD1\u5206\u6790\u300D"), "\u3002\u89C9\u5F97\u8FD9\u9898\u503C\u5F97\u53CD\u590D\u770B\uFF0C\u5C31\u70B9\u4E0B\u9762\u7684\u6309\u94AE\u52A0\u5165\u9519\u9898\u672C\u3002"), analysis && /*#__PURE__*/React.createElement("div", {
     className: "space-y-3 pt-2"
   }, /*#__PURE__*/React.createElement("div", {
     className: "flex items-center gap-2"
@@ -1393,7 +1552,7 @@ function CapturePage({
     analysis: analysis,
     onSave: save,
     saving: false,
-    saved: Boolean(savedId)
+    saved: savedId ? 'pending' : undefined
   }), savedId ? /*#__PURE__*/React.createElement("div", {
     className: "flex gap-2"
   }, /*#__PURE__*/React.createElement("button", {
@@ -1405,11 +1564,39 @@ function CapturePage({
   }, "\u518D\u5206\u6790\u4E00\u9898")) : analysis === DEMO_ANALYSIS && /*#__PURE__*/React.createElement("button", {
     onClick: reset,
     className: "w-full rounded-xl bg-slate-100 py-2.5 text-sm font-medium text-slate-600"
-  }, "\u6536\u8D77\u793A\u4F8B")));
+  }, "\u6536\u8D77\u793A\u4F8B")), loading && /*#__PURE__*/React.createElement(LoadingOverlay, {
+    text: "\u8001\u5E08\u6B63\u5728\u770B\u8FD9\u9053\u9898\u2026",
+    hint: mode === 'photo' ? '识别图片通常 5-15 秒' : '通常 5-15 秒'
+  }));
+}
+
+/** 全屏加载遮罩 —— 让用户明确知道「系统在干活」，而不是界面卡住了 */
+function LoadingOverlay({
+  text,
+  hint
+}) {
+  return /*#__PURE__*/React.createElement("div", {
+    className: "gk-fade-in fixed inset-0 z-40 flex items-center justify-center bg-slate-900/35 px-8 backdrop-blur-[2px]"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "w-full max-w-xs rounded-2xl bg-white p-6 text-center shadow-xl"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "mx-auto h-10 w-10 animate-spin rounded-full border-[3px] border-brand-100 border-t-brand-600"
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "gk-loading-text mt-4 font-semibold text-slate-800"
+  }, text), hint && /*#__PURE__*/React.createElement("div", {
+    className: "mt-1 text-xs text-slate-400"
+  }, hint)));
 }
 
 /* ==========================================================================
  * §8 记录页
+ *
+ * 两个视图：
+ *   错题本   —— 你主动收藏、要反复看的题（saved: true）
+ *   最近分析 —— 所有分析过的题，不管有没有收藏（自动留档）
+ *
+ * 为什么要有「最近分析」：分析本身就有价值。看完觉得「我会了，不用存」，
+ * 过几天想回顾「上次我是怎么想的」，没有痕迹就找不回来了。
  * ========================================================================*/
 
 function RecordsPage({
@@ -1417,33 +1604,47 @@ function RecordsPage({
 }) {
   const {
     records,
-    remove
+    remove,
+    patch,
+    showToast
   } = useApp();
+  const [view, setView] = useState('saved'); // saved | all
   const [filter, setFilter] = useState('all');
   const [kw, setKw] = useState('');
+  const savedCount = records.filter(r => r.saved).length;
   const list = useMemo(() => {
-    let l = records;
+    let l = view === 'saved' ? records.filter(r => r.saved) : records;
     if (filter !== 'all') l = l.filter(r => r.module === filter);
     if (kw.trim()) {
       const k = kw.trim();
       l = l.filter(r => (r.questionText || '').includes(k) || (r.topic || '').includes(k) || (r.analysis?.error_summary || '').includes(k));
     }
     return l;
-  }, [records, filter, kw]);
-  if (!records.length) {
-    return /*#__PURE__*/React.createElement(Empty, {
-      icon: "\uD83D\uDCCB",
-      title: "\u9519\u9898\u672C\u8FD8\u662F\u7A7A\u7684",
-      desc: "\u53BB\u300C\u5206\u6790\u300D\u9875\u62CD\u4E00\u9053\u505A\u9519\u7684\u9898\uFF0C\u5B83\u5C31\u4F1A\u51FA\u73B0\u5728\u8FD9\u91CC\uFF0C\u5E76\u4E14\u81EA\u52A8\u7EDF\u8BA1\u9519\u56E0\u3002"
-    });
-  }
+  }, [records, view, filter, kw]);
+  const moduleOptions = useMemo(() => MODULES.filter(m => records.some(r => r.module === m.key)), [records]);
   return /*#__PURE__*/React.createElement("div", {
     className: "space-y-3"
   }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h1", {
     className: "text-xl font-bold text-slate-800"
-  }, "\u9519\u9898\u672C"), /*#__PURE__*/React.createElement("p", {
+  }, "\u8BB0\u5F55"), /*#__PURE__*/React.createElement("p", {
     className: "mt-0.5 text-sm text-slate-500"
-  }, "\u5171 ", records.length, " \u6761\u8BB0\u5F55")), /*#__PURE__*/React.createElement("input", {
+  }, "\u5206\u6790\u8FC7\u7684\u9898\u90FD\u4F1A\u7559\u6863\uFF0C\u5171 ", records.length, " \u6761")), /*#__PURE__*/React.createElement("div", {
+    className: "flex rounded-xl bg-slate-100 p-1"
+  }, [{
+    k: 'saved',
+    label: `错题本 ${savedCount}`
+  }, {
+    k: 'all',
+    label: `最近分析 ${records.length}`
+  }].map(t => /*#__PURE__*/React.createElement("button", {
+    key: t.k,
+    onClick: () => setView(t.k),
+    className: 'flex-1 rounded-lg py-2 text-sm font-medium transition ' + (view === t.k ? 'bg-white text-brand-700 shadow-sm' : 'text-slate-500')
+  }, t.label))), records.length === 0 ? /*#__PURE__*/React.createElement(Empty, {
+    icon: "\uD83D\uDCCB",
+    title: "\u8FD8\u6CA1\u6709\u4EFB\u4F55\u8BB0\u5F55",
+    desc: "\u53BB\u300C\u5206\u6790\u300D\u9875\u62CD\u4E00\u9053\u9898\u6216\u7C98\u8D34\u4E00\u9053\u9898\uFF0C\u5206\u6790\u5B8C\u4F1A\u81EA\u52A8\u7559\u6863\u5728\u8FD9\u91CC\u3002"
+  }) : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("input", {
     value: kw,
     onChange: e => setKw(e.target.value),
     placeholder: "\u641C\u7D22\u9898\u5E72\u3001\u8003\u70B9\u3001\u9519\u56E0\u2026",
@@ -1453,13 +1654,14 @@ function RecordsPage({
   }, /*#__PURE__*/React.createElement("button", {
     onClick: () => setFilter('all'),
     className: 'flex-none rounded-full border px-3 py-1.5 text-xs font-medium ' + (filter === 'all' ? 'border-brand-300 bg-brand-50 text-brand-700' : 'border-slate-200 bg-white text-slate-500')
-  }, "\u5168\u90E8"), MODULES.filter(m => records.some(r => r.module === m.key)).map(m => /*#__PURE__*/React.createElement("button", {
+  }, "\u5168\u90E8"), moduleOptions.map(m => /*#__PURE__*/React.createElement("button", {
     key: m.key,
     onClick: () => setFilter(m.key),
     className: 'flex-none rounded-full border px-3 py-1.5 text-xs font-medium ' + (filter === m.key ? m.chip : 'border-slate-200 bg-white text-slate-500')
   }, m.name))), list.length === 0 && /*#__PURE__*/React.createElement(Empty, {
     icon: "\uD83D\uDD0D",
-    title: "\u6CA1\u6709\u5339\u914D\u7684\u8BB0\u5F55"
+    title: view === 'saved' ? '错题本还是空的' : '没有匹配的记录',
+    desc: view === 'saved' ? '在「最近分析」里点开一条，就能把它加入错题本。' : undefined
   }), /*#__PURE__*/React.createElement("div", {
     className: "space-y-2"
   }, list.map(r => /*#__PURE__*/React.createElement(Card, {
@@ -1467,14 +1669,20 @@ function RecordsPage({
     className: "p-3.5"
   }, /*#__PURE__*/React.createElement("button", {
     onClick: () => onOpenDetail(r.id),
-    className: "w-full text-left"
+    className: "press-flat w-full text-left"
   }, /*#__PURE__*/React.createElement("div", {
     className: "mb-1.5 flex flex-wrap items-center gap-1.5"
   }, /*#__PURE__*/React.createElement(ModuleChip, {
     module: r.module
   }), r.topic && /*#__PURE__*/React.createElement(Chip, {
     className: "border-slate-200 bg-slate-50 text-slate-600"
-  }, r.topic), /*#__PURE__*/React.createElement("span", {
+  }, r.topic), r.saved ? /*#__PURE__*/React.createElement(Chip, {
+    className: "border-brand-200 bg-brand-50 text-brand-700"
+  }, "\uD83D\uDCCC \u9519\u9898\u672C") : /*#__PURE__*/React.createElement(Chip, {
+    className: "border-slate-200 bg-white text-slate-400"
+  }, "\u672A\u6536\u85CF"), r.status === 'correct' && /*#__PURE__*/React.createElement(Chip, {
+    className: "border-emerald-200 bg-emerald-50 text-emerald-700"
+  }, "\uD83C\uDF93 \u5DF2\u638C\u63E1"), /*#__PURE__*/React.createElement("span", {
     className: "ml-auto text-[11px] text-slate-400"
   }, new Date(r.createdAt).toLocaleDateString('zh-CN', {
     month: 'numeric',
@@ -1487,13 +1695,32 @@ function RecordsPage({
     key: k,
     errKey: k
   })))), /*#__PURE__*/React.createElement("div", {
-    className: "mt-2 flex justify-end border-t border-slate-100 pt-2"
-  }, /*#__PURE__*/React.createElement("button", {
+    className: "mt-2 flex items-center justify-end gap-3 border-t border-slate-100 pt-2"
+  }, !r.saved && /*#__PURE__*/React.createElement("button", {
     onClick: () => {
-      if (confirm('确定删除这条记录？')) remove(r.id);
+      patch(r.id, {
+        saved: true
+      });
+      showToast('已加入错题本');
     },
-    className: "text-xs text-slate-400 hover:text-rose-600"
-  }, "\u5220\u9664"))))));
+    className: "rounded-lg bg-brand-50 px-3 py-1.5 text-xs font-medium text-brand-700"
+  }, "+ \u52A0\u5165\u9519\u9898\u672C"), r.saved && /*#__PURE__*/React.createElement("button", {
+    onClick: () => {
+      patch(r.id, {
+        saved: false
+      });
+      showToast('已移出错题本，仍保留在最近分析里');
+    },
+    className: "text-xs text-slate-400"
+  }, "\u79FB\u51FA\u9519\u9898\u672C"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => {
+      if (confirm('确定删除这条记录？删除后无法恢复。')) {
+        remove(r.id);
+        showToast('已删除');
+      }
+    },
+    className: "text-xs text-slate-400"
+  }, "\u5220\u9664")))))));
 }
 
 /* ==========================================================================
@@ -2336,7 +2563,9 @@ function SettingsPage() {
     updateSettings,
     records,
     reload,
-    stats
+    stats,
+    clearAllRecords,
+    showToast
   } = useApp();
   const [draft, setDraft] = useState(settings);
   const [msg, setMsg] = useState('');
@@ -2490,17 +2719,20 @@ function SettingsPage() {
     const f = e.target.files?.[0];
     if (!f) return;
     const reader = new FileReader();
-    reader.onload = () => {
+    reader.onload = async () => {
       try {
         const data = JSON.parse(reader.result);
         const incoming = Array.isArray(data) ? data : data.records;
         if (!Array.isArray(incoming)) throw new Error('格式不对');
-        const existing = records;
-        const ids = new Set(existing.map(r => r.id));
-        const merged = [...existing, ...incoming.filter(r => r?.id && !ids.has(r.id))];
-        localStorage.setItem(K_RECORDS, JSON.stringify(merged));
-        reload();
-        setMsg(`导入成功，新增 ${merged.length - existing.length} 条`);
+        const ids = new Set(records.map(r => r.id));
+        const fresh = incoming.filter(r => r?.id && !ids.has(r.id)).map(r => ({
+          saved: true,
+          updatedAt: r.updatedAt || Date.now(),
+          ...r
+        }));
+        if (fresh.length) await dbPutRecords(fresh);
+        await reload();
+        setMsg(`导入成功，新增 ${fresh.length} 条`);
       } catch (err) {
         setMsg('✗ 导入失败：' + err.message);
       }
@@ -2659,11 +2891,10 @@ function SettingsPage() {
     },
     className: "flex-1 rounded-xl border border-brand-200 bg-white py-2 text-sm font-medium text-brand-700"
   }, "\u8F7D\u5165\u793A\u4F8B\u6570\u636E"), /*#__PURE__*/React.createElement("button", {
-    onClick: () => {
+    onClick: async () => {
       if (!confirm('确定清空所有记录？此操作不可撤销，建议先导出备份。')) return;
-      setRecords([]);
-      setMsg('已清空');
-      setTimeout(() => setMsg(''), 2000);
+      await clearAllRecords();
+      showToast('已清空所有记录');
     },
     className: "flex-1 rounded-xl border border-rose-200 bg-white py-2 text-sm font-medium text-rose-600"
   }, "\u6E05\u7A7A\u6240\u6709\u8BB0\u5F55")))), /*#__PURE__*/React.createElement(Card, {
@@ -2684,38 +2915,105 @@ const useApp = () => useContext(AppContext);
 function AppProvider({
   children
 }) {
-  const [settings, setSettings] = useState(() => ({
-    ...DEFAULT_SETTINGS,
-    ...lsGet(K_SETTINGS, {})
-  }));
-  const [records, setRecords] = useState(() => lsGet(K_RECORDS, []));
-  const [customTips, setCustomTips] = useState(() => lsGet(K_TIPS, []));
-  useEffect(() => lsSet(K_SETTINGS, settings), [settings]);
-  useEffect(() => lsSet(K_RECORDS, records), [records]);
-  useEffect(() => lsSet(K_TIPS, customTips), [customTips]);
+  const [settings, setSettings] = useState(DEFAULT_SETTINGS);
+  const [records, setRecords] = useState([]);
+  const [customTips, setCustomTips] = useState([]);
+  const [hydrated, setHydrated] = useState(false);
+  const [migratedCount, setMigratedCount] = useState(0);
+  // 全局提示条：任何操作完成后都给一个看得见的确认，避免「我点到了吗」
+  const [toast, setToast] = useState(null);
+  const toastTimer = useRef(null);
+  const showToast = useCallback((message, kind = 'ok') => {
+    setToast({
+      message,
+      kind
+    });
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(null), 2600);
+  }, []);
+
+  // 启动时：先迁移旧数据（一次性），再从 IndexedDB 读出来
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      let moved = 0;
+      try {
+        moved = await migrateFromLocalStorage();
+      } catch (e) {
+        console.warn('旧数据迁移失败（不影响使用）', e);
+      }
+      const [s, r, t] = await Promise.all([dbGetSettings(), dbGetRecords(), dbGetCustomTips()]);
+      if (!alive) return;
+      if (s) setSettings(cur => ({
+        ...cur,
+        ...s
+      }));
+      setRecords(Array.isArray(r) ? r : []);
+      setCustomTips(Array.isArray(t) ? t : []);
+      setMigratedCount(moved);
+      setHydrated(true);
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  // 设置和技巧都是小对象，变化时整体写回（量小，不必精打细算）
+  useEffect(() => {
+    if (hydrated) dbSaveSettings(settings);
+  }, [settings, hydrated]);
+  useEffect(() => {
+    if (hydrated) dbSaveCustomTips(customTips);
+  }, [customTips, hydrated]);
   const updateSettings = useCallback(p => setSettings(s => ({
     ...s,
     ...p
   })), []);
+
+  /**
+   * 新增一条记录。
+   * 注意：现在**每次分析都会调用它** —— 分析完就留档，不管有没有加入错题本。
+   * saved 字段区分「只是分析过」和「已加入错题本」。
+   */
   const create = useCallback(rec => {
+    const now = Date.now();
     const full = {
-      id: `r_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
-      createdAt: Date.now(),
+      id: `r_${now}_${Math.random().toString(36).slice(2, 7)}`,
+      createdAt: now,
+      updatedAt: now,
       status: 'wrong',
+      saved: false,
       ...rec
     };
     // createdAt 允许被显式指定（示例数据要铺在最近几天，好让趋势图有内容）
     setRecords(rs => [full, ...rs]);
+    dbPutRecord(full);
     return full;
   }, []);
   const patch = useCallback((id, p) => {
-    setRecords(rs => rs.map(r => r.id === id ? {
-      ...r,
-      ...p
-    } : r));
+    setRecords(rs => rs.map(r => {
+      if (r.id !== id) return r;
+      const next = {
+        ...r,
+        ...p,
+        updatedAt: Date.now()
+      };
+      dbPutRecord(next);
+      return next;
+    }));
   }, []);
-  const remove = useCallback(id => setRecords(rs => rs.filter(r => r.id !== id)), []);
-  const reload = useCallback(() => setRecords(lsGet(K_RECORDS, [])), []);
+  const remove = useCallback(id => {
+    setRecords(rs => rs.filter(r => r.id !== id));
+    dbDeleteRecord(id);
+  }, []);
+  const reload = useCallback(async () => {
+    const r = await dbGetRecords();
+    setRecords(Array.isArray(r) ? r : []);
+  }, []);
+  const clearAllRecords = useCallback(async () => {
+    await dbClearRecords();
+    setRecords([]);
+  }, []);
   const addTip = useCallback(tip => {
     const full = {
       ...tip,
@@ -2737,14 +3035,34 @@ function AppProvider({
     patch,
     remove,
     reload,
+    clearAllRecords,
     stats,
     tips,
     addTip,
-    removeTip
+    removeTip,
+    hydrated,
+    migratedCount,
+    toast,
+    showToast
   };
   return /*#__PURE__*/React.createElement(AppContext.Provider, {
     value: value
-  }, children);
+  }, children, /*#__PURE__*/React.createElement(ToastBar, {
+    toast: toast
+  }));
+}
+
+/** 底部提示条。挂在 AppProvider 里，所以任何页面都能触发 */
+function ToastBar({
+  toast
+}) {
+  if (!toast) return null;
+  const ok = toast.kind !== 'error';
+  return /*#__PURE__*/React.createElement("div", {
+    className: "pointer-events-none fixed inset-x-0 bottom-24 z-50 flex justify-center px-6"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: 'gk-toast max-w-md rounded-xl px-4 py-2.5 text-sm font-medium shadow-lg ' + (ok ? 'bg-slate-800/95 text-white' : 'bg-rose-600/95 text-white')
+  }, ok ? '✓ ' : '⚠️ ', toast.message));
 }
 const TABS = [{
   key: 'capture',
@@ -2752,7 +3070,7 @@ const TABS = [{
   icon: '📷'
 }, {
   key: 'records',
-  label: '错题',
+  label: '记录',
   icon: '📋'
 }, {
   key: 'weakness',
@@ -2769,7 +3087,10 @@ const TABS = [{
 }];
 function Shell() {
   const {
-    settings
+    settings,
+    hydrated,
+    migratedCount,
+    showToast
   } = useApp();
   const [tab, setTab] = useState('capture');
   const [detailId, setDetailId] = useState(null);
@@ -2777,6 +3098,26 @@ function Shell() {
   useEffect(() => {
     if (!settings.apiKey && !settings.proxyUrl) setTab('settings');
   }, [settings.apiKey, settings.proxyUrl]);
+
+  // 旧版本数据迁移完成后提示一次，让用户知道东西没丢
+  useEffect(() => {
+    if (hydrated && migratedCount > 0) {
+      showToast(`已把 ${migratedCount} 条旧记录迁移到新存储`);
+    }
+  }, [hydrated, migratedCount, showToast]);
+
+  // IndexedDB 是异步的，首次进来要等一下，避免闪一下空数据
+  if (!hydrated) {
+    return /*#__PURE__*/React.createElement("div", {
+      className: "flex min-h-screen items-center justify-center"
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "text-center"
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "mx-auto h-9 w-9 animate-spin rounded-full border-[3px] border-brand-100 border-t-brand-600"
+    }), /*#__PURE__*/React.createElement("div", {
+      className: "mt-3 text-sm text-slate-500"
+    }, "\u6B63\u5728\u8BFB\u53D6\u672C\u5730\u6570\u636E\u2026")));
+  }
   let body;
   if (essayOpen) {
     body = /*#__PURE__*/React.createElement(EssayPage, {
@@ -2808,17 +3149,23 @@ function Shell() {
     className: "min-h-screen bg-slate-50"
   }, /*#__PURE__*/React.createElement("div", {
     className: "mx-auto max-w-2xl px-4 pb-28 pt-4"
-  }, body), "      ", !hideNav && /*#__PURE__*/React.createElement("nav", {
+  }, body), !hideNav && /*#__PURE__*/React.createElement("nav", {
     className: "fixed inset-x-0 bottom-0 z-20 border-t border-slate-200 bg-white/95 backdrop-blur"
   }, /*#__PURE__*/React.createElement("div", {
     className: "mx-auto flex max-w-2xl pb-[env(safe-area-inset-bottom)]"
-  }, TABS.map(t => /*#__PURE__*/React.createElement("button", {
-    key: t.key,
-    onClick: () => setTab(t.key),
-    className: 'flex flex-1 flex-col items-center gap-0.5 py-2.5 text-[11px] transition ' + (tab === t.key ? 'font-semibold text-brand-600' : 'text-slate-400')
-  }, /*#__PURE__*/React.createElement("span", {
-    className: "text-lg leading-none"
-  }, t.icon), t.label)))));
+  }, TABS.map(t => {
+    const active = tab === t.key;
+    return /*#__PURE__*/React.createElement("button", {
+      key: t.key,
+      onClick: () => setTab(t.key),
+      "aria-current": active ? 'page' : undefined,
+      className: 'relative flex flex-1 flex-col items-center gap-0.5 py-2.5 text-[11px] transition ' + (active ? 'font-semibold text-brand-600' : 'text-slate-400')
+    }, active && /*#__PURE__*/React.createElement("span", {
+      className: "absolute inset-x-4 top-0 h-0.5 rounded-full bg-brand-600"
+    }), /*#__PURE__*/React.createElement("span", {
+      className: 'text-lg leading-none ' + (active ? 'scale-110' : '')
+    }, t.icon), t.label);
+  }))));
 }
 
 /**
@@ -2856,9 +3203,14 @@ class ErrorBoundary extends React.Component {
     }, String(this.state.error?.message || this.state.error)), /*#__PURE__*/React.createElement("div", {
       className: "mt-3 flex gap-2"
     }, /*#__PURE__*/React.createElement("button", {
-      onClick: () => {
+      onClick: async () => {
         try {
-          const raw = localStorage.getItem('gk_records_v1') || '[]';
+          const all = await dbGetRecords();
+          const raw = JSON.stringify({
+            app: 'gongkao-coach',
+            version: 2,
+            records: all || []
+          }, null, 2);
           const blob = new Blob([raw], {
             type: 'application/json'
           });

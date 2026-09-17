@@ -2,7 +2,10 @@
 @tailwind components;
 @tailwind utilities;
 
-/* 免构建项目：字体与基础修正直接写原生 CSS，避免依赖 @apply 的编译细节 */
+/* ============================================================================
+ * 免构建项目：字体与基础修正直接写原生 CSS，避免依赖 @apply 的编译细节
+ * ==========================================================================*/
+
 html {
   -webkit-text-size-adjust: 100%;
 }
@@ -28,4 +31,109 @@ button {
 ::-webkit-scrollbar {
   height: 0;
   width: 0;
+}
+
+/* ============================================================================
+ * 触摸反馈
+ *
+ * 手机上没有鼠标悬停，如果按钮按下时没有任何视觉变化，用户会怀疑「我点到了吗」。
+ * Tailwind 的 active: 变体在部分移动浏览器上触发不稳定，所以这里用原生 CSS
+ * 统一兜底：所有可点元素按下时轻微缩小 + 变暗，给出确定的即时反馈。
+ * ==========================================================================*/
+
+button,
+[role='button'],
+a,
+label {
+  -webkit-tap-highlight-color: transparent; /* 关掉系统默认的灰色高亮，用我们自己的 */
+  touch-action: manipulation; /* 去掉 300ms 点击延迟 */
+}
+
+button:not(:disabled):active,
+[role='button']:active,
+a:active,
+label:active {
+  transform: scale(0.96);
+  transition: transform 60ms ease-out;
+}
+
+/* 主按钮按下时颜色也加深一点，反馈更明确 */
+button:not(:disabled):active {
+  filter: brightness(0.92);
+}
+
+/* 卡片类可点区域（整块可点）按下时给个背景变化，比缩放更容易感知 */
+button.press-flat:not(:disabled):active {
+  transform: none;
+  background-color: #f1f5f9;
+}
+
+/* 输入框聚焦时边框更明显（手机上光标可能看不清） */
+input:focus,
+textarea:focus {
+  outline: none;
+}
+
+/* 正在加载时的进度条动画 */
+@keyframes gk-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+.gk-loading-text {
+  animation: gk-pulse 1.4s ease-in-out infinite;
+}
+
+/* 分析中的浮层淡入 */
+@keyframes gk-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.gk-fade-in {
+  animation: gk-fade-in 160ms ease-out;
+}
+
+/* 提示条从底部滑入 */
+@keyframes gk-slide-up {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.gk-toast {
+  animation: gk-slide-up 200ms ease-out;
+}
+
+/* 完成对勾的弹入效果，用于「已加入错题本」这类确认 */
+@keyframes gk-pop {
+  0% {
+    transform: scale(0.8);
+    opacity: 0;
+  }
+  60% {
+    transform: scale(1.06);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+.gk-pop {
+  animation: gk-pop 260ms ease-out;
 }
