@@ -60,11 +60,32 @@ const CASES = [
     file: 'bailu-shenlun.json',
     label: '申论 · 白鹭',
     expect: ['题干四要素', '信号词', '前置提炼', '总括句', '采分点', '未经证实', '禁止自创'],
+    // 反过来查：这些顶层字段如果有内容，就**必须**出现在提示词里。
+    // 写了却没被压缩逻辑带上，等于白写 —— 这种"静默丢失"最难发现。
+    sections: {
+      promptFragment: '本流派的批改要求',
+      evidenceDiscipline: '证据分级纪律',
+      shenTiSiYaoSu: '审题：题干四要素',
+      keywordReading: '读材料：8 类信号词',
+      logicReading: '逻辑阅读',
+      qianZhiTiLian: '前置提炼',
+      answerIronRules: '作答铁律',
+      structuralRules: '总括句规则',
+      scoring: '判分方法',
+      unverifiedWarnings: '不得用作扣分理由',
+    },
   },
   {
     file: 'gk-rubric.json',
     label: '申论 · 国考评分标准',
     expect: ['一类文', '二类文', '三类文', '四类文', '致命', '官方'],
+    sections: {
+      promptFragment: '本流派的批改要求',
+      honestyNote: '关于标准的性质',
+      bigEssay: '大作文分档',
+      smallQuestions: '小题评分',
+      expressionAndPaper: '卷面与表达',
+    },
   },
 ]
 
@@ -110,6 +131,24 @@ for (const c of CASES) {
     bad++
   } else {
     console.log('✓ 没有明显的拼接问题')
+  }
+
+  // 反向检查：包里写了内容的字段，是不是都被注入进提示词了
+  if (c.sections) {
+    const lost = []
+    for (const [field, marker] of Object.entries(c.sections)) {
+      const v = pack[field]
+      if (v === undefined || v === null) continue
+      // 空对象/空数组视为没写
+      if (Array.isArray(v) ? v.length === 0 : Object.keys(v).length === 0) continue
+      if (!text.includes(marker)) lost.push(field)
+    }
+    if (lost.length) {
+      console.log('✗ 包里有内容但没被注入（压缩逻辑漏了）：' + lost.join('、'))
+      bad++
+    } else {
+      console.log('✓ 包里写的字段全部被注入（没有静默丢失）')
+    }
   }
 
   console.log('\n---------- 实际注入的提示词 ----------')
