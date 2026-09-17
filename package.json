@@ -1,0 +1,27 @@
+{
+  "name": "gongkao-coach",
+  "private": true,
+  "version": "0.3.0",
+  "description": "考公做题分析器：拍题 → 快解 + 错因归因 → 弱点报告（免构建 PWA）",
+  "scripts": {
+    "dev": "node scripts/build.mjs && node server.mjs",
+    "watch": "node scripts/build.mjs --watch",
+    "serve": "node server.mjs",
+    "lan-ip": "node scripts/lan-ip.mjs",
+    "build": "node scripts/build.mjs",
+    "css": "node node_modules/tailwindcss/lib/cli.js -c tailwind.config.js -i src-css/input.css -o styles.css --minify",
+    "vendor": "node scripts/vendor.mjs",
+    "check": "node scripts/check.mjs",
+    "verify": "node scripts/build.mjs && node scripts/check.mjs && node scripts/verify-render.mjs"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@babel/standalone": "^7.26.4",
+    "jsdom": "^30.1.0",
+    "tailwindcss": "^3.4.17",
+    "wrangler": "^4.133.0"
+  }
+}

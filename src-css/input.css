@@ -1,0 +1,31 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 免构建项目：字体与基础修正直接写原生 CSS，避免依赖 @apply 的编译细节 */
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  background: #f8fafc;
+  color: #1e293b;
+  -webkit-font-smoothing: antialiased;
+  font-family: -apple-system, BlinkMacSystemFont, 'HarmonyOS Sans SC', 'PingFang SC',
+    'Microsoft YaHei', 'Helvetica Neue', sans-serif;
+}
+
+/* 手机浏览器上输入框字号小于 16px 会触发自动放大，统一到 16px */
+input,
+textarea,
+select,
+button {
+  font-size: 16px;
+  font-family: inherit;
+}
+
+/* 隐藏滚动条但保留滚动能力（横向筛选条用） */
+::-webkit-scrollbar {
+  height: 0;
+  width: 0;
+}

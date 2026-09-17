@@ -1,0 +1,24 @@
+# GitHub Pages 部署说明
+#
+# 为什么需要 .nojekyll？
+# GitHub Pages 默认用 Jekyll 处理站点，会忽略以 _ 开头的文件、也可能干扰某些静态资源。
+# 放一个空的 .nojekyll 就是告诉它"别处理，原样发布"。
+#
+# 部署步骤（任选一种）：
+#
+# 【方式一 · 推荐】Cloudflare Pages
+#   1. 把本目录推到 GitHub 仓库
+#   2. Cloudflare Dashboard → Workers & Pages → Create → Pages → 连接该仓库
+#   3. 构建命令：留空        输出目录：/
+#   4. 得到 https://你的项目.pages.dev，国内访问通常比 GitHub Pages 稳
+#
+# 【方式二】GitHub Pages
+#   1. 仓库 Settings → Pages → Source 选 "Deploy from a branch"
+#   2. 分支选 main，目录选 / (root)，保存
+#   3. 等 1 分钟，访问 https://你的用户名.github.io/仓库名/
+#
+# ⚠️ 注意：本项目所有资源都用相对路径（./app.js 等），
+#    所以放在仓库子路径下（/仓库名/）也能正常打开，不需要额外配置。
+#
+# ⚠️ 公开部署前请先看 README 里「关于 API Key 安全」一节：
+#    不要把带自己 Key 的版本公开给别人用。

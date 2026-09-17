@@ -1,0 +1,17 @@
+# 依赖与构建缓存
+node_modules/
+.npm-cache/
+*.log
+
+# 本地环境
+.env
+.env.local
+.DS_Store
+Thumbs.db
+
+# 编辑器
+.vscode/
+.idea/
+
+# 备份文件（用户导出的错题备份不要提交）
+考公错题备份_*.json

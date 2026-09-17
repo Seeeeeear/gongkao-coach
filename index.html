@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#2563eb" />
+    <meta name="description" content="考公做题分析器：拍题 → 快解 + 错因归因 → 弱点报告" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="考公分析" />
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="icon" href="./icon.svg" />
+    <title>考公做题分析器</title>
+
+    <!-- Tailwind 预编译产物（离线可用，不用 CDN） -->
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div id="root">
+      <div style="padding:2rem;text-align:center;color:#64748b;font-family:sans-serif">
+        正在加载考公做题分析器…
+      </div>
+    </div>
+
+    <!-- 运行库：优先本地 vendor/，失败才回退 CDN，避免国内网络打不开 -->
+    <script src="./vendor/react.production.min.js"></script>
+    <script src="./vendor/react-dom.production.min.js"></script>
+    <script>
+      ;(function () {
+        var fallbacks = {
+          React: 'https://unpkg.com/react@18.3.1/umd/react.production.min.js',
+          ReactDOM: 'https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js',
+        }
+        Object.keys(fallbacks).forEach(function (name) {
+          if (!window[name]) {
+            document.write('<script src="' + fallbacks[name] + '"><\/script>')
+          }
+        })
+      })()
+    </script>
+
+    <script>
+      // 出错时别白屏，把原因显示出来
+      window.addEventListener('error', function (e) {
+        var root = document.getElementById('root')
+        if (root && !root.querySelector('.card')) {
+          root.innerHTML =
+            '<div style="padding:2rem;font-family:sans-serif;color:#b91c1c">' +
+            '<b>加载出错了</b><p style="font-size:14px;color:#64748b">' +
+            (e.message || '未知错误') +
+            '</p><p style="font-size:13px;color:#94a3b8">请刷新重试；若反复失败，检查 vendor/ 下的 react 和 react-dom 是否都在，以及 app.js、styles.css 是否已在项目根目录。</p></div>'
+        }
+      })
+    </script>
+
+    <!-- 应用代码：由 scripts/build.mjs 从 app.jsx 预编译而来（浏览器不需要 Babel，加载快） -->
+    <script src="./app.js"></script>
+
+    <script>
+      // 注册 Service Worker：手机上打开过一次后可离线启动
+      // file:// 直接打开时浏览器会拒绝注册，属于正常情况，这里静默跳过
+      if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
+        window.addEventListener('load', function () {
+          navigator.serviceWorker.register('./sw.js').catch(function (e) {
+            console.warn('离线缓存未启用：', e.message)
+          })
+        })
+      }
+    </script>
+  </body>
+</html>
