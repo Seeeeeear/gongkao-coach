@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "note": "这是轻量索引，随 app.js 一起打包（约 1-2KB）。真正的详细内容在 packs/*.json，按需加载并缓存到 IndexedDB。",
+  "packs": [
+    {
+      "id": "general-data",
+      "name": "通用速算法",
+      "author": "公开方法论整理",
+      "subject": "data",
+      "license": "self",
+      "file": "packs/general-data.json",
+      "builtin": true,
+      "summary": "不绑定任何老师，资料分析通用速算体系：截位、估算、比较、特征数字",
+      "triggers": ["增长率", "增长量", "比重", "倍数", "平均数", "基期", "现期", "同比", "环比", "占比", "指数"]
+    },
+    {
+      "id": "bailu-shenlun",
+      "name": "白鹭申论",
+      "author": "白鹭（半月谈）",
+      "subject": "essay",
+      "license": "MIT",
+      "licenseNote": "方法论提炼自 coffe-d/Shenlun.skill（MIT 许可）。已按证据分级标注：仅采用经真题答案验证的条目。",
+      "source": "https://github.com/coffe-d/Shenlun.skill",
+      "file": "packs/bailu-shenlun.json",
+      "builtin": true,
+      "summary": "题干四要素审题 + 8 类信号词阅读 + 前置提炼 + 国考采分点覆盖评分",
+      "triggers": ["概括", "归纳", "概述", "简述", "总结", "列出", "分析", "理解", "阐释", "谈谈你的看法", "对策", "建议"]
+    },
+    {
+      "id": "gk-shenlun-rubric",
+      "name": "国考申论评分标准",
+      "author": "公开资料整理",
+      "subject": "essay",
+      "license": "self",
+      "file": "packs/gk-rubric.json",
+      "builtin": true,
+      "summary": "国考大作文四类文分档 + 五维权重 + 致命扣分点；小题采分点给分规则",
+      "triggers": ["大作文", "议论文", "文章写作", "评分", "判分", "多少分"]
+    },
+    {
+      "id": "huasheng13-data",
+      "name": "花生十三 · 资料分析",
+      "author": "花生十三",
+      "subject": "data",
+      "license": "none",
+      "licenseNote": "该 skill 仓库未声明许可（默认保留所有权利），且自述基于课程资料整理。此条仅为索引占位，不复刻其内容；如需使用请自行准备内容并放在本地。",
+      "source": "https://github.com/WangJunqing-coder/huasheng13-skill",
+      "file": null,
+      "builtin": false,
+      "disabled": true,
+      "summary": "（未启用）该来源无开源许可，不随项目分发",
+      "triggers": []
+    }
+  ]
+}

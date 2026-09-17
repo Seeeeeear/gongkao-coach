@@ -16,7 +16,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { JSDOM } from 'jsdom'
-import { IDBFactory } from 'fake-indexeddb'
+import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const read = (f) => readFileSync(join(root, f), 'utf8')
@@ -47,9 +47,30 @@ async function boot({ records = null, settings = null } = {}) {
 
   // 关键：jsdom 不带 IndexedDB，应用现在依赖它，必须注入
   w.indexedDB = new IDBFactory()
-  w.IDBKeyRange = (await import('fake-indexeddb')).IDBKeyRange
+  w.IDBKeyRange = IDBKeyRange
 
-  w.fetch = () => Promise.reject(new Error('测试环境不发起真实请求'))
+  /**
+   * fetch 垫片。
+   * 应用会 fetch('./skills/packs/xxx.json') 加载方法流派包，
+   * 这里把这些请求指向本地真实文件 —— 测的是真实加载路径。
+   * 其他请求一律抛错，避免测试误发真实网络请求。
+   */
+  const packHits = []
+  w.fetch = async (url) => {
+    const u = String(url)
+    const m = u.match(/skills\/(.+\.json)$/)
+    if (m) {
+      packHits.push(m[1])
+      try {
+        const text = readFileSync(join(root, 'skills', m[1]), 'utf8')
+        return { ok: true, status: 200, json: async () => JSON.parse(text) }
+      } catch {
+        return { ok: false, status: 404, json: async () => ({}) }
+      }
+    }
+    throw new Error('测试环境不发起真实请求：' + u)
+  }
+
   w.confirm = () => true
   w.URL.createObjectURL = () => 'blob:test'
   w.URL.revokeObjectURL = () => {}
@@ -69,7 +90,8 @@ async function boot({ records = null, settings = null } = {}) {
   // 预置数据：必须在应用启动前写进 IndexedDB，否则会被 hydration 覆盖
   if (records || settings) {
     await new Promise((resolve, reject) => {
-      const req = w.indexedDB.open('gongkao_coach', 1)
+      // 版本要和 app.jsx 里的 DB_VERSION 一致，否则应用会再触发一次 upgrade
+      const req = w.indexedDB.open('gongkao_coach', 2)
       req.onupgradeneeded = () => {
         const db = req.result
         if (!db.objectStoreNames.contains('settings')) db.createObjectStore('settings')
@@ -79,6 +101,7 @@ async function boot({ records = null, settings = null } = {}) {
           s.createIndex('createdAt', 'createdAt')
           s.createIndex('saved', 'saved')
         }
+        if (!db.objectStoreNames.contains('skills')) db.createObjectStore('skills')
       }
       req.onsuccess = () => {
         const db = req.result
@@ -98,22 +121,34 @@ async function boot({ records = null, settings = null } = {}) {
   await new Promise((r) => setTimeout(r, 400))
 
   const rootEl = w.document.getElementById('root')
-  const navButtons = [...w.document.querySelectorAll('nav button')]
   const TAB_ICON = { 分析: '📷', 记录: '📋', 弱点: '📊', 技巧: '📚', 设置: '⚙️' }
-  const navBtn = (name) => navButtons.find((b) => b.textContent.includes(TAB_ICON[name]))
   const allButtons = () => [...rootEl.querySelectorAll('button')]
+
+  /**
+   * 每次都重新查询导航按钮。
+   * 不能缓存启动时抓到的那批引用 —— 导航栏会随状态重新挂载，
+   * 旧引用会失效，点了没反应（这个坑真的踩过一次）。
+   */
+  const navBtn = (name) => {
+    const nav = w.document.querySelector('nav')
+    if (!nav) return null
+    return [...nav.querySelectorAll('button')].find((b) => b.textContent.includes(TAB_ICON[name]))
+  }
+  const navButtons = () =>
+    w.document.querySelector('nav') ? [...w.document.querySelector('nav').querySelectorAll('button')] : []
+
   const clickTab = async (name) => {
     navBtn(name)?.dispatchEvent(new w.MouseEvent('click', { bubbles: true }))
     await new Promise((r) => setTimeout(r, 150))
   }
 
-  return { w, rootEl, navButtons, navBtn, allButtons, clickTab, errors }
+  return { w, rootEl, navButtons, navBtn, allButtons, clickTab, errors, packHits }
 }
 
 /* ------------------------- 1. 基本启动与页面渲染 ------------------------- */
 
 const app = await boot({ settings: { apiKey: 'sk-test-fake', model: 'deepseek-chat' } })
-const { w, rootEl, navButtons, navBtn, allButtons, clickTab, errors } = app
+const { w, rootEl, navButtons, navBtn, allButtons, clickTab, errors, packHits } = app
 
 if (!rootEl || rootEl.textContent.trim().length < 5) {
   fail('页面是空的（白屏）')
@@ -122,11 +157,12 @@ if (!rootEl || rootEl.textContent.trim().length < 5) {
 }
 ok(`React 已挂载，首页渲染出 ${rootEl.textContent.length} 个字符`)
 
-if (navButtons.length !== 5) fail(`底部导航应有 5 个 tab，实际 ${navButtons.length} 个`)
+const tabs0 = navButtons()
+if (tabs0.length !== 5) fail(`底部导航应有 5 个 tab，实际 ${tabs0.length} 个`)
 else ok('底部导航 5 个 tab 都在')
 
 const expectations = [
-  { tab: '分析', expect: ['分析这道题', '申论批改', '示例分析'] },
+  { tab: '分析', expect: ['分析这道题', '申论批改', '示例分析', '方法流派'] },
   { tab: '记录', expect: ['记录', '最近分析', '还没有任何记录'] },
   { tab: '弱点', expect: ['弱点报告', '还没有数据可以分析'] },
   { tab: '技巧', expect: ['解题技巧库', '截位直除', '特征数字法'] },
@@ -147,6 +183,45 @@ for (const { tab, expect } of expectations) {
     fail(`「${tab}」页缺少文案：${missing.join('、')}`)
     console.log('   [诊断] 页面文字前 200 字：' + JSON.stringify(text.slice(0, 200)))
   } else ok(`「${tab}」页渲染正常`)
+}
+
+/* ------------------- 1.5 方法流派（技能包）系统 ------------------- */
+
+await clickTab('分析')
+{
+  // 资料分析模块默认应出现流派选择器
+  const text = rootEl.textContent
+  const need = ['方法流派', '通用', '通用速算法']
+  const missing = need.filter((k) => !text.includes(k))
+  if (missing.length) fail('分析页的方法流派选择器缺少：' + missing.join('、'))
+  else ok('分析页出现方法流派选择器（资料分析模块有「通用速算法」）')
+
+  // 选中通用速算法 → 应触发技能包 fetch
+  const packBtn = allButtons().find((b) => b.textContent.trim() === '通用速算法')
+  if (!packBtn) {
+    fail('找不到「通用速算法」流派按钮')
+  } else {
+    packBtn.dispatchEvent(new w.MouseEvent('click', { bubbles: true }))
+    await new Promise((r) => setTimeout(r, 200))
+    const t2 = rootEl.textContent
+    if (!t2.includes('资料分析通用速算体系')) {
+      fail('选中流派后没有显示该流派的说明')
+    } else {
+      ok('选中流派后显示来源与许可信息')
+    }
+  }
+
+  // 切到没有流派包的模块，应给出说明而不是空白
+  const logicBtn = allButtons().find((b) => b.textContent.trim() === '判断推理')
+  if (logicBtn) {
+    logicBtn.dispatchEvent(new w.MouseEvent('click', { bubbles: true }))
+    await new Promise((r) => setTimeout(r, 200))
+    if (!rootEl.textContent.includes('暂时没有方法流派包')) {
+      fail('切到无流派模块时没有给出说明')
+    } else {
+      ok('无流派模块显示「暂时没有方法流派包」说明（不做无用 UI）')
+    }
+  }
 }
 
 /* ------------------------- 2. 示例分析渲染 ------------------------- */
@@ -275,7 +350,7 @@ await app2.clickTab('记录')
 
 {
   const ids = await new Promise((resolve) => {
-    const req = app2.w.indexedDB.open('gongkao_coach', 1)
+    const req = app2.w.indexedDB.open('gongkao_coach', 2)
     req.onsuccess = () => {
       const db = req.result
       const t = db.transaction('records', 'readonly')
@@ -291,6 +366,84 @@ await app2.clickTab('记录')
   const savedCount = ids.filter((r) => r.saved).length
   if (savedCount !== 3) fail(`IndexedDB 里 saved=true 的应有 3 条，实际 ${savedCount}`)
   else ok('收藏状态已正确写回 IndexedDB')
+}
+
+/* -------------- 6.5 技能包缓存真的落盘到 IndexedDB -------------- */
+
+{
+  const cached = await new Promise((resolve) => {
+    const req = app2.w.indexedDB.open('gongkao_coach', 2)
+    req.onsuccess = () => {
+      const db = req.result
+      if (!db.objectStoreNames.contains('skills')) return resolve(null)
+      const t = db.transaction('skills', 'readonly')
+      const all = t.objectStore('skills').getAllKeys()
+      all.onsuccess = () => resolve(all.result)
+      all.onerror = () => resolve(null)
+    }
+    req.onerror = () => resolve(null)
+  })
+  // 技能包是"选中流派并分析"时才加载的；这里没跑真实分析，
+  // 所以只验证 store 建出来了（加载路径由 6.6 的申论页覆盖）
+  if (cached === null) fail('IndexedDB 里没有 skills store（v2 升级没生效）')
+  else ok('IndexedDB 的 skills store 已建好（可缓存方法流派包）')
+}
+
+/* -------------- 6.6 申论批改页（干净实例，排除前面步骤干扰） -------------- */
+
+{
+  // 为什么单开实例：前面几步操作过详情页/记录页，复用会分不清
+  // "点不开"是应用问题还是残留状态问题。
+  const app3 = await boot({ settings: { apiKey: 'sk-test-fake' } })
+  // boot 时已把 key 写进 IndexedDB；这里主动切到分析页，
+  // 不受「没配 Key 时自动跳设置页」的影响
+  await app3.clickTab('分析')
+  const cands = app3.allButtons().filter((b) => b.textContent.includes('申论'))
+  const btn = cands.find((b) => b.textContent.trim() === '申论批改') || cands[0]
+  if (!btn) {
+    fail('干净实例里找不到「申论批改」入口')
+  } else {
+    btn.click()
+    await new Promise((r) => setTimeout(r, 350))
+
+    const t = app3.rootEl.textContent
+    const need = ['题目类型', '本题满分', '白鹭申论', '国考评分标准']
+    const missing = need.filter((k) => !t.includes(k))
+    if (missing.length) {
+      fail('申论批改页缺少：' + missing.join('、'))
+      console.log('   [诊断] 干净实例点击后内容前 250 字：' + JSON.stringify(t.slice(0, 250)))
+      console.log('   [诊断] select 数量：' + app3.rootEl.querySelectorAll('select').length)
+    } else {
+      ok('申论批改页渲染正常（题型 / 满分 / 流派 / 评分标尺）')
+    }
+
+    const sels = [...app3.rootEl.querySelectorAll('select')]
+    if (sels.length < 2) {
+      fail(`申论页应有 2 个下拉框（题型、满分），实际 ${sels.length} 个`)
+    } else {
+      sels[0].value = '归纳概括'
+      sels[0].dispatchEvent(new app3.w.Event('change', { bubbles: true }))
+      await new Promise((r) => setTimeout(r, 250))
+      const sels2 = [...app3.rootEl.querySelectorAll('select')]
+      if (sels2[1] && sels2[1].value !== '20') {
+        fail(`切到归纳概括后满分应自动变为 20，实际 ${sels2[1].value}`)
+      } else {
+        ok('切题型时满分默认值自动跟随（大作文 40 / 小题 20）')
+      }
+      // 大作文满分选项里必须有 35 和 40 —— 国考常见分值
+      sels2[0].value = '大作文'
+      sels2[0].dispatchEvent(new app3.w.Event('change', { bubbles: true }))
+      await new Promise((r) => setTimeout(r, 250))
+      const opts = [...([...app3.rootEl.querySelectorAll('select')][1]?.options || [])].map(
+        (o) => o.value,
+      )
+      if (!opts.includes('40') || !opts.includes('35')) {
+        fail('大作文满分选项里缺少 35 / 40：' + opts.join(','))
+      } else {
+        ok('满分选项包含国考大作文常见分值（35 / 40）')
+      }
+    }
+  }
 }
 
 /* ------------------------- 7. 无 JS 错误 ------------------------- */

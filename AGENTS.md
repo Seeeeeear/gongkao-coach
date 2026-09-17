@@ -45,9 +45,33 @@ scripts/build.mjs        app.jsx → app.js（npm run build / watch）
 scripts/check.mjs        语法校验
 scripts/verify-render.mjs jsdom 真实渲染验证（改完必跑）
 scripts/vendor.mjs       复制 React 到 vendor/
+scripts/fetch-skills.mjs 抓第三方 skill 原始文档到 vendor-skills/（已 gitignore）
+skills/index.json        技能包索引（仅供参考，实际索引内联在 app.jsx）
+skills/packs/*.json      方法流派包（按需加载，每个 8-12KB）
 src-css/input.css        Tailwind 源样式
 server.mjs               零依赖静态服务器
 ```
+
+## 方法流派（技能包）系统
+- **索引内联、内容按需**：`SKILLS_INDEX` 直接写在 app.jsx 里（约 2KB）；
+  各流派内容在 `skills/packs/*.json`（每个 8-12KB），用 `loadPack(id)` 按需 fetch，
+  并缓存到 IndexedDB 的 `skills` store（**离线可用**）。
+- **不要把流派内容内联进 app.jsx** —— 会让首屏体积暴涨，也违背按需加载的设计。
+- 新增流派的流程：
+  1. 写 `skills/packs/<id>.json`
+  2. 在 `SKILLS_INDEX.packs` 加一条索引（含 subject / file / license / triggers）
+  3. 跑 `npm run verify`
+- **许可纪律**：只收录 MIT/Apache/BSD 等宽松许可的来源。
+  无 LICENSE 的仓库默认「保留所有权利」，**不要收录其内容**；
+  需要占位时用 `disabled: true` + `file: null`（见索引里的 huasheng13-data）。
+  每个包必须写清 `license` / `source` / `attribution`。
+- **证据分级纪律（申论包尤其重要）**：白鹭包里区分 `verified` / `partial` / `unverified`。
+  标 `unverified` 的条目（如「综合分析＝3W 十六字方针」）**不得用于扣分**，
+  也不得说成「某老师的方法」。改这些文件时不要破坏这个分级。
+- **诚实标注**：国考评分标准包里有 `honestyNote` —— 国家公务员局从未公开评分细则，
+  那些分档是培训行业归纳的惯例。批改时必须如实说明，不得冒充官方标准。
+- `packToPromptText(pack)` 负责把包压成提示词片段（默认截到 2800 字）。
+  包变大时要调整压缩逻辑，不要整包塞进 prompt。
 
 ## 改动流程（务必遵守）
 1. 只改 `app.jsx`（或 `src-css/input.css`、`tailwind.config.js`）

@@ -9,7 +9,7 @@
  * 所以单题分析、申论批改这些需要联网的功能在鸿蒙上仍依赖网络，这是正常的。
  */
 
-const VERSION = 'v2'
+const VERSION = 'v3'
 const CACHE = `gk-coach-${VERSION}`
 
 // 应用外壳：首次安装时全部预缓存，之后离线也能启动
@@ -22,6 +22,10 @@ const SHELL = [
   './icon.svg',
   './vendor/react.production.min.js',
   './vendor/react-dom.production.min.js',
+  // 方法流派包：单个 8-12KB，预缓存后离线也能用已下载的流派
+  './skills/packs/general-data.json',
+  './skills/packs/bailu-shenlun.json',
+  './skills/packs/gk-rubric.json',
 ]
 
 self.addEventListener('install', (event) => {

@@ -1,6 +1,6 @@
 /* 本文件由 scripts/build.mjs 从 app.jsx 自动生成，请勿直接修改。
  * 改代码请改 app.jsx，然后运行：node scripts/build.mjs
- * 生成时间：2026/9/17 22:21:59
+ * 生成时间：2026/9/17 23:46:18
  */
 /* ============================================================================
  * 考公做题分析器 —— 免构建单文件应用
@@ -287,9 +287,11 @@ const BUILTIN_TIPS = [{
  * ========================================================================*/
 
 const DB_NAME = 'gongkao_coach';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORE_SETTINGS = 'settings';
 const STORE_RECORDS = 'records';
+// 技能包缓存（方法流派的 JSON），v2 新增
+const STORE_SKILLS = 'skills';
 
 // 旧版 localStorage 的键，仅用于一次性迁移
 const K_OLD_SETTINGS = 'gk_settings_v1';
@@ -350,6 +352,10 @@ function openDB() {
         store.createIndex('updatedAt', 'updatedAt');
         store.createIndex('createdAt', 'createdAt');
         store.createIndex('saved', 'saved');
+      }
+      // v2：技能包缓存。老用户升级时这里会自动补建，不会丢数据
+      if (!db.objectStoreNames.contains(STORE_SKILLS)) {
+        db.createObjectStore(STORE_SKILLS);
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -505,7 +511,208 @@ function statsToText(stats) {
 }
 
 /* ==========================================================================
- * §4 AI 调用
+ * §4 方法流派（技能包）
+ *
+ * 解决什么问题：同一个模块，不同老师的方法体系不一样（截位怎么截、要不要写
+ * 总括句）。如果 AI 今天用 A 的讲法、明天用 B 的讲法，你练的时候动作就乱了。
+ * 选定一个流派后，AI 会用那一套流程和术语来讲，保持一致。
+ *
+ * 加载策略（重要，别改坏）：
+ *   - 索引很小（约 2KB），直接内联进 app.js，随应用一起加载
+ *   - 各流派的详细内容 8-12KB，按需 fetch('./skills/packs/xxx.json')
+ *   - 抓到后缓存在 IndexedDB，之后离线也能用
+ *   - 这样手机首屏不会因为技能包变大而变慢
+ * ========================================================================*/
+
+const SKILLS_INDEX = {
+  version: 1,
+  packs: [{
+    id: 'general-data',
+    name: '通用速算法',
+    author: '公开方法论整理',
+    subject: 'data',
+    license: 'self',
+    file: 'packs/general-data.json',
+    builtin: true,
+    summary: '资料分析通用速算体系：截位、415 系数、假设分配、比重变化'
+  }, {
+    id: 'bailu-shenlun',
+    name: '白鹭申论',
+    author: '白鹭（半月谈）',
+    subject: 'essay',
+    license: 'MIT',
+    source: 'https://github.com/coffe-d/Shenlun.skill',
+    file: 'packs/bailu-shenlun.json',
+    builtin: true,
+    summary: '题干四要素审题 + 8 类信号词阅读 + 前置提炼 + 采分点覆盖判分'
+  }, {
+    id: 'gk-shenlun-rubric',
+    name: '国考申论评分标准',
+    author: '公开资料整理',
+    subject: 'essay',
+    license: 'self',
+    file: 'packs/gk-rubric.json',
+    builtin: true,
+    summary: '大作文四类文分档 + 五维权重 + 致命扣分点 + 卷面分规则'
+  }, {
+    id: 'huasheng13-data',
+    name: '花生十三 · 资料分析',
+    author: '花生十三',
+    subject: 'data',
+    license: 'none',
+    licenseNote: '该 skill 仓库未声明许可（默认保留所有权利），且自述基于课程资料整理。此处仅作占位，不复刻其内容；如需使用请自行准备内容。',
+    source: 'https://github.com/WangJunqing-coder/huasheng13-skill',
+    file: null,
+    builtin: false,
+    disabled: true,
+    summary: '（未启用）该来源无开源许可，不随项目分发'
+  }]
+};
+
+/** 技能包缓存也放 IndexedDB，按 packId 存原始 JSON */
+const dbGetPackCache = id => tx(STORE_SKILLS, 'readonly', s => {
+  const req = s.get(id);
+  return {
+    __req: req
+  };
+}).catch(() => null);
+const dbPutPackCache = (id, payload) => tx(STORE_SKILLS, 'readwrite', s => s.put(payload, id)).catch(() => null);
+
+/**
+ * 取一个技能包的内容。三层：内存 → IndexedDB → 网络。
+ * 网络失败但本地有缓存时用缓存；都没有就返回 null（调用方退回通用提示词）。
+ */
+const packMemory = {};
+async function loadPack(id) {
+  if (!id) return null;
+  if (packMemory[id]) return packMemory[id];
+  const meta = SKILLS_INDEX.packs.find(p => p.id === id);
+  if (!meta || meta.disabled || !meta.file) return null;
+  const cached = await dbGetPackCache(id);
+  if (cached && cached.version === meta.version && cached.data) {
+    packMemory[id] = cached.data;
+    return cached.data;
+  }
+  try {
+    const res = await fetch(`./skills/${meta.file}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    await dbPutPackCache(id, {
+      version: meta.version,
+      data,
+      cachedAt: Date.now()
+    });
+    packMemory[id] = data;
+    return data;
+  } catch (e) {
+    // 网络挂了但有旧缓存 → 用旧的，总比没有好
+    if (cached && cached.data) {
+      console.warn(`技能包 ${id} 拉取失败，使用本地缓存`, e);
+      packMemory[id] = cached.data;
+      return cached.data;
+    }
+    console.warn(`技能包 ${id} 加载失败`, e);
+    return null;
+  }
+}
+
+/** 列出某个模块可选的方法流派 */
+function packsForSubject(subject) {
+  return SKILLS_INDEX.packs.filter(p => p.subject === subject && !p.disabled);
+}
+
+/**
+ * 把技能包压成一段能塞进 system prompt 的文本。
+ *
+ * 为什么要压：完整包 8-12KB，全塞进去每次分析都多花不少 token，还可能干扰模型。
+ * 这里只取「指令 + 骨干方法」，示例和长篇说明留给人工查阅。
+ */
+function packToPromptText(pack, opts = {}) {
+  if (!pack) return '';
+  const {
+    maxChars = 2800
+  } = opts;
+  const lines = [];
+  if (pack.promptFragment) lines.push('【本流派的批改要求】\n' + pack.promptFragment);
+  if (pack.honestyNote?.text) lines.push('【关于标准的性质，必须如实转述】\n' + pack.honestyNote.text);
+  if (pack.evidenceDiscipline?.rule) lines.push('【证据分级纪律】\n' + pack.evidenceDiscipline.rule);
+  if (Array.isArray(pack.methods)) {
+    lines.push('【本流派的方法清单与判定规则】');
+    pack.methods.forEach(m => {
+      const parts = [`▸ ${m.name}（${m.when || ''}）`];
+      if (m.principle) parts.push('原理：' + m.principle);
+      if (m.formula) parts.push('公式：' + m.formula);
+      if (Array.isArray(m.decisionRules)) {
+        m.decisionRules.forEach(r => {
+          parts.push(`  · 当${r.when} → ${r.action}${r.example ? '（例：' + r.example + '）' : ''}`);
+        });
+      }
+      if (Array.isArray(m.steps)) parts.push('步骤：' + m.steps.join(' → '));
+      if (Array.isArray(m.traps)) parts.push('易错：' + m.traps.join('；'));
+      lines.push(parts.join('\n'));
+    });
+  }
+  if (pack.shenTiSiYaoSu?.elements) {
+    lines.push('【审题：题干四要素】');
+    pack.shenTiSiYaoSu.elements.forEach(el => {
+      if (Array.isArray(el.rules)) {
+        el.rules.forEach(r => {
+          if (r.verbs) lines.push(`· ${r.verbs.join('/')} → ${r.type}`);else if (r.type && r.object) lines.push(`· ${r.type} → 作答对象是${r.object}`);else if (typeof r === 'string') lines.push('· ' + r);
+        });
+      }
+      if (Array.isArray(el.regular)) el.regular.forEach(r => lines.push(`· ${r.word}：${r.meaning}`));
+      if (Array.isArray(el.processing)) el.processing.forEach(r => lines.push(`· ${r.word}：${r.meaning}`));
+    });
+  }
+  if (Array.isArray(pack.keywordReading?.signals)) {
+    lines.push('【读材料：8 类信号词】');
+    pack.keywordReading.signals.forEach(s => lines.push(`· ${s.type}（${s.markers}）→ ${s.use}`));
+  }
+  if (Array.isArray(pack.logicReading?.relations)) {
+    lines.push('【逻辑阅读】');
+    pack.logicReading.relations.forEach(r => lines.push(`· ${r.type}：${r.principle || r.note || ''}`));
+  }
+  if (Array.isArray(pack.qianZhiTiLian?.rules)) {
+    lines.push('【前置提炼】\n' + pack.qianZhiTiLian.rules.slice(0, 5).map(r => '· ' + r).join('\n'));
+  }
+  if (Array.isArray(pack.answerIronRules?.rules)) {
+    lines.push('【作答铁律】\n' + pack.answerIronRules.rules.map(r => `· ${r.name}：${r.detail}`).join('\n'));
+  }
+  if (Array.isArray(pack.structuralRules?.rules)) {
+    lines.push('【总括句规则】\n' + pack.structuralRules.rules.map(r => '· ' + r).join('\n'));
+  }
+  if (Array.isArray(pack.scoring?.method)) {
+    lines.push('【判分方法：采分点覆盖法】\n' + pack.scoring.method.map(s => '· ' + s).join('\n'));
+  }
+  if (pack.unverifiedWarnings?.rule) {
+    lines.push('【不得用作扣分理由的说法】\n' + pack.unverifiedWarnings.rule);
+    (pack.unverifiedWarnings.items || []).forEach(i => lines.push(`· 禁用：${i.claim}`));
+  }
+  if (pack.bigEssay?.grades) {
+    lines.push('【大作文分档】');
+    pack.bigEssay.grades.forEach(g => lines.push(`· ${g.grade} ${g.range} 分：${g.standard}`));
+  }
+  if (Array.isArray(pack.bigEssay?.dimensions)) {
+    lines.push('【五维权重】');
+    pack.bigEssay.dimensions.forEach(d => lines.push(`· ${d.name} ${d.weight}% —— ${d.note}`));
+  }
+  if (Array.isArray(pack.bigEssay?.fatalDeductions)) {
+    lines.push('【致命失分项】');
+    pack.bigEssay.fatalDeductions.forEach(f => lines.push(`· ${f.item}：${f.rule}`));
+  }
+  if (Array.isArray(pack.smallQuestions?.rules)) {
+    lines.push('【小题评分】\n' + pack.smallQuestions.rules.map(r => `· ${r.item}：${r.detail}`).join('\n'));
+  }
+  if (Array.isArray(pack.expressionAndPaper?.rules)) {
+    lines.push('【卷面与表达】\n' + pack.expressionAndPaper.rules.slice(0, 4).map(r => '· ' + r).join('\n'));
+  }
+  let text = lines.join('\n\n');
+  if (text.length > maxChars) text = text.slice(0, maxChars) + '\n…（内容较长已截断）';
+  return text;
+}
+
+/* ==========================================================================
+ * §5 AI 调用
  * ========================================================================*/
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -699,13 +906,18 @@ async function aiAnalyzeQuestion(settings, {
   module,
   userAnswer,
   correctAnswer,
-  userNote
+  userNote,
+  packPrompt,
+  packName
 }) {
   const hints = [];
   if (module) hints.push(`学生自认为属于模块：${moduleOf(module).name}`);
   if (userAnswer) hints.push(`学生选的答案：${userAnswer}`);
   if (correctAnswer) hints.push(`正确答案：${correctAnswer}`);
   if (userNote) hints.push(`学生的自我描述：${userNote}`);
+
+  // 方法流派注入：选中流派时，用那一套流程和术语来讲
+  const system = QUESTION_SYSTEM + (packPrompt ? `\n\n────────────────\n学生选定了【${packName || '某'}】这套方法体系。你必须**严格按下面的方法和判定规则讲解**，术语和步骤都要跟它一致，不要混入其他流派的讲法：\n\n${packPrompt}\n────────────────` : '');
   let userContent;
   if (image) {
     userContent = [{
@@ -722,7 +934,7 @@ async function aiAnalyzeQuestion(settings, {
   }
   const content = await callChat(settings, [{
     role: 'system',
-    content: QUESTION_SYSTEM
+    content: system
   }, {
     role: 'user',
     content: userContent
@@ -746,12 +958,23 @@ async function aiAnalyzeEssay(settings, {
   image,
   question,
   answer,
-  reference
+  reference,
+  essayType,
+  scoreFull,
+  packPrompt,
+  packName,
+  rubricPrompt
 }) {
   const parts = [];
   if (question) parts.push(`【题目要求】\n${question}`);
   if (reference) parts.push(`【参考答案/评分标准】\n${reference}`);
   if (answer) parts.push(`【我的作答】\n${answer}`);
+
+  // 把题型和分值明确告诉模型 —— 否则它会用百分制或猜一个满分，
+  // 你就没法对照真实考试成绩（国考大作文通常 35 或 40 分）
+  const meta = [];
+  if (essayType) meta.push(`题目类型：${essayType}`);
+  meta.push(scoreFull ? `本题满分：${scoreFull} 分。评分必须按这个满分来给，不要用百分制。` : '题目没说满分。默认按 40 分制评分，并在结果里注明「如实际为 35 分请告知，我按比例重算」。');
   let userContent;
   if (image) {
     userContent = [{
@@ -766,9 +989,10 @@ async function aiAnalyzeEssay(settings, {
   } else {
     userContent = `请批改下面的申论作答。\n\n${parts.join('\n\n')}`;
   }
+  const system = ESSAY_SYSTEM + `\n\n────────────────\n【本题信息】\n${meta.join('\n')}\n────────────────` + (packPrompt ? `\n\n学生选定了【${packName || '某'}】这套方法体系。按它的流程和判分口径批改：\n\n${packPrompt}` : '') + (rubricPrompt ? `\n\n【评分标尺】\n${rubricPrompt}` : '');
   const content = await callChat(settings, [{
     role: 'system',
-    content: ESSAY_SYSTEM
+    content: system
   }, {
     role: 'user',
     content: userContent
@@ -1023,6 +1247,60 @@ function buildDemoRecords(create) {
  * §6 通用组件（原 §5）
  * ========================================================================*/
 
+/**
+ * 方法流派选择器。
+ *
+ * 为什么要有它：不同老师的方法体系不一样（截位怎么截、要不要写总括句）。
+ * 不选定流派时，AI 每次可能给你不同的讲法，你练的时候动作就乱了。
+ * 选定后提示词里会注入那套方法的判定规则，讲法就稳定了。
+ *
+ * 没有可用流派的模块（言语、数量等）不显示选择器，只给一句说明 ——
+ * 不做无用 UI。
+ */
+function MethodPicker({
+  module,
+  value,
+  onChange,
+  subject
+}) {
+  const subj = subject || module;
+  const packs = packsForSubject(subj);
+  if (!packs.length) {
+    return /*#__PURE__*/React.createElement("div", {
+      className: "mb-3 rounded-xl bg-slate-50 p-2.5 text-xs text-slate-500"
+    }, "\u8FD9\u4E2A\u6A21\u5757\u6682\u65F6\u6CA1\u6709\u65B9\u6CD5\u6D41\u6D3E\u5305\uFF0C\u7528\u7684\u662F\u901A\u7528\u8BB2\u6CD5\u3002");
+  }
+  const current = packs.find(p => p.id === value);
+  return /*#__PURE__*/React.createElement("div", {
+    className: "mb-3"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "mb-1.5 flex items-center gap-1.5"
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "text-xs font-medium text-slate-500"
+  }, "\u65B9\u6CD5\u6D41\u6D3E"), /*#__PURE__*/React.createElement("span", {
+    className: "text-[11px] text-slate-400"
+  }, "\u9009\u5B9A\u540E AI \u4F1A\u7528\u8FD9\u4E00\u5957\u8BB2\u6CD5")), /*#__PURE__*/React.createElement("div", {
+    className: "flex flex-wrap gap-1.5"
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => onChange(''),
+    className: 'rounded-full border px-3 py-1.5 text-xs font-medium transition ' + (value === '' ? 'border-slate-300 bg-slate-100 text-slate-700' : 'border-slate-200 bg-white text-slate-500')
+  }, "\u901A\u7528"), packs.map(p => /*#__PURE__*/React.createElement("button", {
+    key: p.id,
+    onClick: () => onChange(p.id),
+    className: 'rounded-full border px-3 py-1.5 text-xs font-medium transition ' + (value === p.id ? 'border-brand-300 bg-brand-50 text-brand-700' : 'border-slate-200 bg-white text-slate-500')
+  }, p.name))), current && /*#__PURE__*/React.createElement("div", {
+    className: "mt-2 rounded-xl border border-brand-100 bg-brand-50/60 p-2.5"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "text-xs text-brand-800"
+  }, current.summary), /*#__PURE__*/React.createElement("div", {
+    className: "mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-slate-500"
+  }, /*#__PURE__*/React.createElement("span", null, "\u6765\u6E90\uFF1A", current.author), /*#__PURE__*/React.createElement("span", null, "\u8BB8\u53EF\uFF1A", current.license === 'self' ? '自建' : current.license === 'MIT' ? 'MIT（可自由使用）' : current.license), current.source && /*#__PURE__*/React.createElement("a", {
+    href: current.source,
+    target: "_blank",
+    rel: "noreferrer",
+    className: "text-brand-600 underline"
+  }, "\u539F\u59CB\u4ED3\u5E93"))));
+}
 function Card({
   children,
   className = ''
@@ -1321,6 +1599,8 @@ function CapturePage({
   const [correctAnswer, setCorrectAnswer] = useState('');
   const [userNote, setUserNote] = useState('');
   const [module, setModule] = useState(settings.defaultModule || 'data');
+  // 方法流派：选 '' 表示用通用提示词，不加任何流派约束
+  const [packId, setPackId] = useState('');
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState('');
   const [analysis, setAnalysis] = useState(null);
@@ -1347,13 +1627,25 @@ function CapturePage({
     setAnalysis(null);
     setSavedId(null);
     try {
+      // 选了方法流派就先把它取出来（首次会 fetch，之后走 IndexedDB 缓存）
+      let packPrompt = '';
+      let packName = '';
+      if (packId) {
+        const pack = await loadPack(packId);
+        if (pack) {
+          packPrompt = packToPromptText(pack);
+          packName = packsForSubject(module).find(p => p.id === packId)?.name || '';
+        }
+      }
       const a = await aiAnalyzeQuestion(settings, {
         image: mode === 'photo' ? image : null,
         questionText,
         module,
         userAnswer,
         correctAnswer,
-        userNote
+        userNote,
+        packPrompt,
+        packName
       });
       if (!a.module) a.module = module;
       setAnalysis(a);
@@ -1370,7 +1662,8 @@ function CapturePage({
         analysis: a,
         source: mode === 'photo' ? 'photo' : 'text',
         userNote,
-        saved: false
+        saved: false,
+        packId: packId || null
       });
       setDraftId(archived.id);
     } catch (e) {
@@ -1378,7 +1671,7 @@ function CapturePage({
     } finally {
       setLoading(false);
     }
-  }, [settings, mode, image, questionText, module, userAnswer, correctAnswer, userNote, create]);
+  }, [settings, mode, image, questionText, module, userAnswer, correctAnswer, userNote, create, packId]);
 
   /** 加入错题本：把已经留档的那条改成 saved，而不是又插一条新的 */
   const save = () => {
@@ -1491,9 +1784,17 @@ function CapturePage({
     className: "mb-3 flex flex-wrap gap-1.5"
   }, MODULES.filter(m => m.key !== 'essay').map(m => /*#__PURE__*/React.createElement("button", {
     key: m.key,
-    onClick: () => setModule(m.key),
+    onClick: () => {
+      setModule(m.key);
+      // 换了模块就清掉流派，避免"资料分析的流派"用在逻辑题上
+      setPackId('');
+    },
     className: 'rounded-full border px-3 py-1.5 text-xs font-medium transition ' + (module === m.key ? m.chip : 'border-slate-200 bg-white text-slate-500')
-  }, m.name))), /*#__PURE__*/React.createElement("div", {
+  }, m.name))), /*#__PURE__*/React.createElement(MethodPicker, {
+    module: module,
+    value: packId,
+    onChange: setPackId
+  }), /*#__PURE__*/React.createElement("div", {
     className: "grid grid-cols-2 gap-3"
   }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
     className: "label"
@@ -2350,6 +2651,13 @@ function EssayPage({
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState('');
   const [result, setResult] = useState(null);
+  // 题型与满分：决定用哪套判分口径。国考大作文通常 35 或 40 分，
+  // 不给分值的话模型会用百分制，你就没法对照真实考试成绩。
+  const [essayType, setEssayType] = useState('大作文');
+  const [scoreFull, setScoreFull] = useState('40');
+  // 方法流派：申论可叠加两个包（白鹭方法论 + 国考评分标准）
+  const [packId, setPackId] = useState('bailu-shenlun');
+  const [rubricOn, setRubricOn] = useState(true);
   const fileRef = useRef(null);
   const onPick = async e => {
     const f = e.target.files?.[0];
@@ -2366,11 +2674,34 @@ function EssayPage({
     setLoading(true);
     setErr('');
     try {
+      let packPrompt = '';
+      let packName = '';
+      if (packId) {
+        const pack = await loadPack(packId);
+        if (pack) {
+          packPrompt = packToPromptText(pack);
+          packName = packsForSubject('essay').find(p => p.id === packId)?.name || '';
+        }
+      }
+
+      // 评分标尺单独加载：它和"方法论"是两回事，可以只用其中一个
+      let rubricPrompt = '';
+      if (rubricOn) {
+        const rubric = await loadPack('gk-shenlun-rubric');
+        if (rubric) rubricPrompt = packToPromptText(rubric, {
+          maxChars: 1800
+        });
+      }
       const r = await aiAnalyzeEssay(settings, {
         image: mode === 'photo' ? image : null,
         question,
         answer,
-        reference
+        reference,
+        essayType,
+        scoreFull: Number(scoreFull) || null,
+        packPrompt,
+        packName,
+        rubricPrompt
       });
       setResult(r);
     } catch (e) {
@@ -2451,7 +2782,49 @@ function EssayPage({
     className: "text-xs text-slate-400"
   }, "\u5B57\u8FF9\u6E05\u6670\u3001\u5149\u7EBF\u5747\u5300\uFF0C\u8BC6\u522B\u66F4\u51C6"))), /*#__PURE__*/React.createElement(Card, {
     className: "space-y-3 p-4"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "grid grid-cols-2 gap-3"
   }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+    className: "label"
+  }, "\u9898\u76EE\u7C7B\u578B"), /*#__PURE__*/React.createElement("select", {
+    value: essayType,
+    onChange: e => {
+      setEssayType(e.target.value);
+      // 换题型时给个合理的默认满分，省得每次手改
+      if (e.target.value === '大作文') setScoreFull('40');else setScoreFull('20');
+    },
+    className: "w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm outline-none focus:border-brand-500"
+  }, ['大作文', '归纳概括', '综合分析', '提出对策', '贯彻执行'].map(t => /*#__PURE__*/React.createElement("option", {
+    key: t,
+    value: t
+  }, t)))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+    className: "label"
+  }, "\u672C\u9898\u6EE1\u5206"), /*#__PURE__*/React.createElement("select", {
+    value: scoreFull,
+    onChange: e => setScoreFull(e.target.value),
+    className: "w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm outline-none focus:border-brand-500"
+  }, (essayType === '大作文' ? ['40', '35', '50'] : ['10', '15', '20', '25', '30']).map(s => /*#__PURE__*/React.createElement("option", {
+    key: s,
+    value: s
+  }, s, " \u5206"))), /*#__PURE__*/React.createElement("p", {
+    className: "mt-1 text-[11px] text-slate-400"
+  }, "\u56FD\u8003\u5927\u4F5C\u6587\u901A\u5E38 35 \u6216 40 \u5206\uFF0C\u586B\u5BF9\u4E86\u624D\u80FD\u5BF9\u7167\u771F\u5B9E\u6210\u7EE9"))), /*#__PURE__*/React.createElement(MethodPicker, {
+    module: "essay",
+    subject: "essay",
+    value: packId,
+    onChange: setPackId
+  }), /*#__PURE__*/React.createElement("label", {
+    className: "flex cursor-pointer items-start gap-2 rounded-xl bg-slate-50 p-2.5"
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "checkbox",
+    checked: rubricOn,
+    onChange: e => setRubricOn(e.target.checked),
+    className: "mt-0.5 h-4 w-4 accent-blue-600"
+  }), /*#__PURE__*/React.createElement("span", {
+    className: "text-xs text-slate-600"
+  }, "\u53E0\u52A0", /*#__PURE__*/React.createElement("b", null, "\u56FD\u8003\u8BC4\u5206\u6807\u51C6"), "\uFF08\u56DB\u7C7B\u6587\u5206\u6863 + \u4E94\u7EF4\u6743\u91CD + \u81F4\u547D\u6263\u5206\u70B9\uFF09", /*#__PURE__*/React.createElement("span", {
+    className: "mt-0.5 block text-[11px] text-slate-400"
+  }, "\u6CE8\uFF1A\u56FD\u5BB6\u516C\u52A1\u5458\u5C40\u4ECE\u672A\u516C\u5F00\u8FC7\u8BC4\u5206\u7EC6\u5219\uFF0C\u8FD9\u5957\u5206\u6863\u6807\u51C6\u662F\u57F9\u8BAD\u884C\u4E1A\u4F9D\u636E\u9605\u5377\u89C4\u5F8B\u5F52\u7EB3\u7684\u60EF\u4F8B\uFF0C\u4E0D\u662F\u5B98\u65B9\u6587\u4EF6"))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
     className: "label"
   }, "\u9898\u76EE\u8981\u6C42"), /*#__PURE__*/React.createElement("textarea", {
     value: question,
@@ -3096,7 +3469,18 @@ function Shell() {
   const [detailId, setDetailId] = useState(null);
   const [essayOpen, setEssayOpen] = useState(false);
   useEffect(() => {
-    if (!settings.apiKey && !settings.proxyUrl) setTab('settings');
+    if (!settings.apiKey && !settings.proxyUrl) {
+      // 每个会话只自动跳一次设置页。
+      // 否则用户每次切回分析页都会被弹走，非常烦；
+      // 而"这次会话已经引导过了"用 sessionStorage 记着就够了。
+      try {
+        if (sessionStorage.getItem('gk_guided')) return;
+        sessionStorage.setItem('gk_guided', '1');
+      } catch {
+        // 隐私模式下 sessionStorage 可能不可用，那就每次都引导
+      }
+      setTab('settings');
+    }
   }, [settings.apiKey, settings.proxyUrl]);
 
   // 旧版本数据迁移完成后提示一次，让用户知道东西没丢
