@@ -17,7 +17,18 @@
 - `app.jsx` 内**不允许出现 `import`/`export`**（Babel standalone 以普通脚本编译），全部靠文件内声明。
 - 样式：Tailwind 3 预编译成 `styles.css`；改样式类后要跑 `npm run css`。
 - 无后端、无路由库：页面切换用 `useState` + props 回调。
-- 数据全部存 `localStorage`。
+- 数据存 **IndexedDB**（`gongkao_coach` 库，settings / records 两个 store），
+  不再用 localStorage；旧 localStorage 数据在启动时自动迁移并清理。
+- 触摸反馈写在 `src-css/input.css` 的原生 CSS 里，**不要依赖 Tailwind 的 `active:` 变体**
+  （部分移动浏览器触发不稳定）。
+
+## 数据模型要点
+- `record.saved`：`true` = 已加入错题本，`false` = 只是分析过（自动留档）。
+  **每次分析都会 create() 一条**，加入错题本时用 `patch(id, { saved: true })` 复用同一条，
+  绝不重复入库。
+- `record.status`：`correct` 表示已掌握，**不计入弱点统计**。
+- `record.redoHistory`：重做记录数组。
+- 统计口径：只有未掌握的题参与错因/模块/考点统计。
 
 ## 文件职责
 ```
@@ -40,10 +51,13 @@ server.mjs               零依赖静态服务器
 
 ## 改动流程（务必遵守）
 1. 只改 `app.jsx`（或 `src-css/input.css`、`tailwind.config.js`）
-2. 跑 `npm run verify` —— 它会编译、校验语法、并用 jsdom 真实渲染一遍
-   （逐个点开 5 个 tab、点开示例分析、载入示例数据，确认没有白屏和 JS 报错）
+2. 跑 `npm run verify` —— 它会编译、校验语法、并用 jsdom + fake-indexeddb 真实渲染一遍
+   （逐个点开 5 个 tab、点示例分析、验证自动留档/收藏/双视图计数/IndexedDB 落盘）
 3. 改了 Tailwind 类或配置，再跑 `npm run css`
-4. 改了需要用户刷新拿到的资源，把 `sw.js` 里的 `VERSION` 加一
+4. **改了 app.js / styles.css 后必须把 `sw.js` 里的 `VERSION` 加一**，
+   否则手机上一直加载旧缓存，你会以为改动没生效
+5. `npm run verify` 需要 `fake-indexeddb` —— jsdom 不带 IndexedDB，
+   测试脚本里必须注入，否则应用启动会失败
 
 ## 硬性约束
 1. **移动端优先**：单列布局、点击区域够大、字号不小于 12px，适配底部安全区。
