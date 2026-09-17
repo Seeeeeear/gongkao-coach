@@ -166,7 +166,7 @@ const expectations = [
   { tab: '记录', expect: ['记录', '最近分析', '还没有任何记录'] },
   { tab: '弱点', expect: ['弱点报告', '还没有数据可以分析'] },
   { tab: '技巧', expect: ['解题技巧库', '截位直除', '特征数字法'] },
-  { tab: '设置', expect: ['API Key', '导出备份', '复制文字版错题本'] },
+  { tab: '设置', expect: ['API Key', '导出备份', '复制文字版错题本', 'huyuhan@aust.edu.cn'] },
 ]
 
 for (const { tab, expect } of expectations) {

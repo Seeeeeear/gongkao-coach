@@ -1,6 +1,6 @@
 /* 本文件由 scripts/build.mjs 从 app.jsx 自动生成，请勿直接修改。
  * 改代码请改 app.jsx，然后运行：node scripts/build.mjs
- * 生成时间：2026/9/17 23:48:39
+ * 生成时间：2026/9/17 23:53:42
  */
 /* ============================================================================
  * 考公做题分析器 —— 免构建单文件应用
@@ -3301,8 +3301,11 @@ function SettingsPage() {
   }, /*#__PURE__*/React.createElement(SectionTitle, null, "\u5728\u624B\u673A\u4E0A\u4F7F\u7528"), /*#__PURE__*/React.createElement("ol", {
     className: "list-decimal space-y-2 pl-5 text-sm text-slate-600"
   }, /*#__PURE__*/React.createElement("li", null, "\u628A\u8FD9\u4E2A\u9879\u76EE\u90E8\u7F72\u5230 Cloudflare Pages \u6216 GitHub Pages\uFF08\u63A8\u4EE3\u7801\u5373\u53EF\uFF0C\u4E0D\u9700\u8981\u6784\u5EFA\uFF09\u3002"), /*#__PURE__*/React.createElement("li", null, "\u624B\u673A\u6D4F\u89C8\u5668\u6253\u5F00\u7F51\u5740\uFF0C\u7528\u6D4F\u89C8\u5668\u83DC\u5355\u91CC\u7684\u300C\u6DFB\u52A0\u5230\u684C\u9762\u300D\uFF0C\u56FE\u6807\u5C31\u50CF App \u4E00\u6837\u3002"), /*#__PURE__*/React.createElement("li", null, "\u9E3F\u8499\u81EA\u5E26\u6D4F\u89C8\u5668\u4E0A\uFF0C\u684C\u9762\u56FE\u6807\u53EF\u80FD\u4F1A\u5E26\u5730\u5740\u680F\uFF0C\u5C5E\u4E8E\u7CFB\u7EDF\u9650\u5236\uFF0C\u529F\u80FD\u4E0D\u53D7\u5F71\u54CD\u3002"))), /*#__PURE__*/React.createElement("div", {
-    className: "pb-4 text-center text-xs text-slate-400"
-  }, "\u8003\u516C\u505A\u9898\u5206\u6790\u5668 \xB7 \u6570\u636E\u672C\u5730\u4F18\u5148 \xB7 \u613F\u4F60\u4E0A\u5CB8"));
+    className: "space-y-1.5 pb-4 text-center text-xs text-slate-400"
+  }, /*#__PURE__*/React.createElement("div", null, "\u8003\u516C\u505A\u9898\u5206\u6790\u5668 \xB7 \u6570\u636E\u672C\u5730\u4F18\u5148 \xB7 \u613F\u4F60\u4E0A\u5CB8"), /*#__PURE__*/React.createElement("div", null, "\u53CD\u9988\u8BF7\u8054\u7CFB\u90AE\u7BB1\uFF1A", /*#__PURE__*/React.createElement("a", {
+    href: "mailto:huyuhan@aust.edu.cn",
+    className: "text-brand-600 underline"
+  }, "huyuhan@aust.edu.cn"))));
 }
 
 /* ==========================================================================

@@ -3475,8 +3475,14 @@ function SettingsPage() {
         </ol>
       </Card>
 
-      <div className="pb-4 text-center text-xs text-slate-400">
-        考公做题分析器 · 数据本地优先 · 愿你上岸
+      <div className="space-y-1.5 pb-4 text-center text-xs text-slate-400">
+        <div>考公做题分析器 · 数据本地优先 · 愿你上岸</div>
+        <div>
+          反馈请联系邮箱：
+          <a href="mailto:huyuhan@aust.edu.cn" className="text-brand-600 underline">
+            huyuhan@aust.edu.cn
+          </a>
+        </div>
       </div>
     </div>
   )
