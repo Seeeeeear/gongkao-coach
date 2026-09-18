@@ -1,6 +1,6 @@
 /* 本文件由 scripts/build.mjs 从 app.jsx 自动生成，请勿直接修改。
  * 改代码请改 app.jsx，然后运行：node scripts/build.mjs
- * 生成时间：2026/9/18 18:29:50
+ * 生成时间：2026/9/18 18:31:31
  */
 /* ============================================================================
  * 考公做题分析器 —— 免构建单文件应用
@@ -846,6 +846,7 @@ const QUESTION_SYSTEM = `你是一位带过 10 年公考行测的名师，擅长
 1. 讲"怎么最快做出来"，而不是把标准答案复述一遍。
 2. 严格区分错误类型：是读题问题、方法问题、计算问题，还是根本不会。不要把"概念不清"说成"粗心"。
 3. 说人话，短句，能直接抄进笔记本。禁止"要认真审题""加强练习"这类空话。
+4. **最重要**：不只给结论，要给"为什么想到这一步"。学生照抄一遍解题步骤没有意义；让他掌握"看到什么信号就想起什么动作"才有意义。
 
 【可选的错因标签】（只能从下面挑，可多选，key 必须原样返回）
 ${ERROR_MENU}
@@ -858,6 +859,13 @@ ${ERROR_MENU}
 - 完全没有相关知识 → concept_gap 或 skipped
 - 做得又对又快 → error_types 返回空数组
 
+【按模块调整讲解重点】不同模块"该看什么"完全不同，不要用一套模板套所有题：
+- 资料分析：先讲**该找哪个数、用哪个公式**，再讲怎么算得快。重点是识别"这题在求什么量"。
+- 数量关系：先讲**这题属于哪个模型**（工程/行程/利润/排列组合…），再讲选什么特值或代入。
+- 判断推理：先讲**怎么找论据和结论**、或图形看哪个规律（位置/样式/数量/属性），再排除选项。
+- 言语理解：先讲**抓主题词和行文脉络**，再看选项是否偷换主体或答非所问。
+- 常识判断：讲清**知识点本身**和记忆线索，不要硬凑解题技巧。
+
 【输出格式】只返回一个 JSON 对象，不要任何解释文字：
 {
   "module": "data|math|logic|verbal|common|other",
@@ -869,6 +877,18 @@ ${ERROR_MENU}
   "is_correct": false,
   "error_types": ["stem_misread"],
   "error_summary": "一句话说清这道题为什么错（不超过 30 字）",
+
+  "reading": {
+    "focus": [
+      { "quote": "题干/材料里值得盯住的一小段原文（10 字以内）", "why": "为什么这里重要（一句话）" }
+    ],
+    "ask": "这道题到底在求什么量？（一句话，比如「求基期量」「求比重的变化幅度」）"
+  },
+
+  "thinking_path": [
+    { "signal": "题干里的什么信号（如「选项首位都不同」「问增长最多的是」）", "move": "它让你想到什么动作（如「可以放心截位，分母取 2 位」）" }
+  ],
+
   "fast_solution": {
     "name": "快解方法名，如 截位直除 / 特征数字法",
     "why_fast": "为什么这个方法快（一句话）",
@@ -876,11 +896,25 @@ ${ERROR_MENU}
     "seconds": 40
   },
   "normal_solution": { "steps": ["常规解法的关键步骤"], "seconds": 120 },
+
+  "pattern": {
+    "name": "母题名（这类题的通用骨架，8 字以内，如「求比重变化」「多主体配对」）",
+    "template": "这类题的通用解法骨架（一句话，能套用到同类题）",
+    "apply_when": "什么情况下该套这个母题（识别信号）",
+    "variants": ["这类题常见的变体/换法，帮你举一反三"]
+  },
+
   "key_points": ["这道题真正考的能力点"],
   "traps": ["出题人埋的坑 / 干扰项设计"],
   "similar_tip": "下次遇到同类题的固定动作（必须可执行）",
   "note_card": "可以抄进错题本的一句话总结"
 }
+
+【质量要求】
+- reading.focus 必须引用题干或材料里的**真实片段**，不要写"注意审题"这种空话
+- thinking_path 至少 2 条，必须体现"信号 → 动作"的因果，不要写成步骤复述
+- pattern.template 要能套用到同类题，不要只描述这一道题
+- 如果这题是学生做对的，thinking_path 和 pattern 同样要给（做对也要知道为什么对）
 
 注意：图片可能含多道题或无关内容，只分析最主要那一题；图片不清晰时在 question_text 里说明并尽量还原。`;
 const ESSAY_SYSTEM = `你是资深公考申论阅卷人兼作文批改老师。点评要像真阅卷人：先给分，再说哪里丢分，最后给能直接用的改法。
@@ -978,6 +1012,12 @@ async function aiAnalyzeQuestion(settings, {
     seconds: 0
   };
   if (!Array.isArray(data.fast_solution.steps)) data.fast_solution.steps = [];
+
+  // 模型偶尔会漏字段或给错类型。这里是唯一挡住"字段缺失导致整页崩"的地方，
+  // 所以宁可啰嗦一点，把新字段逐个规范化。
+  if (!data.reading || typeof data.reading !== 'object') data.reading = null;else if (!Array.isArray(data.reading.focus)) data.reading.focus = [];
+  data.thinking_path = Array.isArray(data.thinking_path) ? data.thinking_path.filter(x => x && (x.signal || x.move)) : [];
+  if (!data.pattern || typeof data.pattern !== 'object') data.pattern = null;else if (!Array.isArray(data.pattern.variants)) data.pattern.variants = [];
   return data;
 }
 async function aiAnalyzeEssay(settings, {
@@ -1174,6 +1214,38 @@ const DEMO_ANALYSIS = {
   is_correct: false,
   error_types: ['concept_gap', 'method_slow'],
   error_summary: '凭感觉判断比重升降，没有用"部分增速与整体增速比大小"这个固定动作',
+  reading: {
+    ask: '求"比重与上年相比的变化幅度"——注意是变化量，不是现在的比重',
+    focus: [{
+      quote: '"与上年相比"',
+      why: '这是比较题，不是计算题。比较题优先找"比什么"，而不是先算两个数'
+    }, {
+      quote: '"占比"',
+      why: '占比 = 部分 ÷ 整体，所以要立刻分清哪个是部分、哪个是整体'
+    }, {
+      quote: '"约"',
+      why: '出现"约"说明允许估算，不必精确算比重'
+    }]
+  },
+  thinking_path: [{
+    signal: '问的是"比重与上年相比"（变化量），不是"比重是多少"',
+    move: '想到比重变化有专用套路，不需要算两个比重'
+  }, {
+    signal: '材料给了两个增长率：部分 8.2%、整体 5.6%',
+    move: '直接比大小就能定升降方向，一半选项立刻排除'
+  }, {
+    signal: '选项里既有"上升/下降"又有不同幅度',
+    move: '想到用|a−b|卡范围：变化幅度一定小于两个增速之差'
+  }, {
+    signal: '选项 B 是 4 个百分点，而 |8.2−5.6| 只有 2.6',
+    move: 'B 超出上界，直接排除，只剩 A'
+  }],
+  pattern: {
+    name: '比重变化判断',
+    template: '凡问"某部分占比比上年上升/下降几个百分点"，都走同一条路：① 找部分增速 a 和整体增速 b；② a>b 升、a<b 降（定方向）；③ 变化幅度必小于 |a−b|（卡范围）；④ 用选项排除，全程不算比重。',
+    apply_when: '题干出现"占比/比重/……率" + "与上年相比/同比" + "上升下降几个百分点"这三件套时，就是这个母题。',
+    variants: ['换个问法：问"比重是否上升"——只做第①②步，更省时间', '材料给的是"两个比重"而不是"两个增速"——需要先各自换算成增速再比', '问"哪一年的比重最高"——那是最值比较，不是变化判断，不能套这个模板']
+  },
   fast_solution: {
     name: '比重变化两步法（先判升降，再定范围）',
     why_fast: '不用算比重，比一个大小、卡一个范围就能选出来',
@@ -1610,11 +1682,60 @@ function AnalysisResult({
     className: "mt-2 space-y-0.5"
   }, analysis.options.map((o, i) => /*#__PURE__*/React.createElement("div", {
     key: i
-  }, o))))), /*#__PURE__*/React.createElement(Card, {
+  }, o))))), (analysis.reading?.focus?.length > 0 || analysis.reading?.ask) && /*#__PURE__*/React.createElement(Card, {
+    className: "p-4"
+  }, /*#__PURE__*/React.createElement(SectionTitle, null, "\u5148\u770B\u4EC0\u4E48"), analysis.reading.ask && /*#__PURE__*/React.createElement("div", {
+    className: "mb-3 rounded-xl bg-brand-50 p-3 text-sm font-medium text-brand-800"
+  }, "\uD83C\uDFAF \u8FD9\u9898\u5728\u6C42\uFF1A", analysis.reading.ask), analysis.reading.focus?.length > 0 && /*#__PURE__*/React.createElement("div", {
+    className: "space-y-2"
+  }, analysis.reading.focus.map((f, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    className: "rounded-xl bg-slate-50 p-3 text-sm"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "font-medium text-slate-800"
+  }, "\u300C", f.quote, "\u300D"), f.why && /*#__PURE__*/React.createElement("div", {
+    className: "mt-1 text-slate-600"
+  }, f.why))))), analysis.thinking_path?.length > 0 && /*#__PURE__*/React.createElement(Card, {
+    className: "border-brand-200 bg-brand-50/40 p-4"
+  }, /*#__PURE__*/React.createElement(SectionTitle, null, "\u4E3A\u4EC0\u4E48\u60F3\u5230\u7528\u8FD9\u62DB"), /*#__PURE__*/React.createElement("div", {
+    className: "space-y-2"
+  }, analysis.thinking_path.map((t, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    className: "flex items-start gap-2 text-sm"
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "mt-0.5 flex h-5 w-5 flex-none items-center justify-center rounded-full bg-brand-600 text-[11px] font-bold text-white"
+  }, i + 1), /*#__PURE__*/React.createElement("div", {
+    className: "flex-1"
+  }, t.signal && /*#__PURE__*/React.createElement("span", {
+    className: "rounded bg-white px-1.5 py-0.5 font-medium text-slate-800"
+  }, t.signal), t.move && /*#__PURE__*/React.createElement("span", {
+    className: "ml-1.5 text-slate-700"
+  }, "\u2192 ", t.move)))))), /*#__PURE__*/React.createElement(Card, {
     className: "p-4"
   }, /*#__PURE__*/React.createElement(SectionTitle, null, "\u600E\u4E48\u6700\u5FEB\u505A\u51FA\u6765"), /*#__PURE__*/React.createElement(SolutionBlock, {
     analysis: analysis
-  })), analysis.key_points?.length > 0 && /*#__PURE__*/React.createElement(Card, {
+  })), analysis.pattern?.name && /*#__PURE__*/React.createElement(Card, {
+    className: "border-violet-200 bg-violet-50/50 p-4"
+  }, /*#__PURE__*/React.createElement(SectionTitle, null, "\u8FD9\u7C7B\u9898\u7684\u901A\u7528\u9AA8\u67B6\uFF08\u6BCD\u9898\uFF09"), /*#__PURE__*/React.createElement("div", {
+    className: "mb-2 flex flex-wrap items-center gap-2"
+  }, /*#__PURE__*/React.createElement(Chip, {
+    className: "border-violet-300 bg-white text-violet-700"
+  }, analysis.pattern.name)), analysis.pattern.template && /*#__PURE__*/React.createElement("div", {
+    className: "rounded-xl bg-white p-3 text-sm text-slate-700"
+  }, analysis.pattern.template), analysis.pattern.apply_when && /*#__PURE__*/React.createElement("div", {
+    className: "mt-2 text-sm text-violet-800"
+  }, "\uD83D\uDD0D \u4EC0\u4E48\u65F6\u5019\u5957\u5B83\uFF1A", analysis.pattern.apply_when), analysis.pattern.variants?.length > 0 && /*#__PURE__*/React.createElement("div", {
+    className: "mt-2"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "mb-1 text-xs font-medium text-slate-500"
+  }, "\u5E38\u89C1\u53D8\u4F53\uFF08\u4E3E\u4E00\u53CD\u4E09\uFF09"), /*#__PURE__*/React.createElement("ul", {
+    className: "space-y-1 text-sm text-slate-700"
+  }, analysis.pattern.variants.map((v, i) => /*#__PURE__*/React.createElement("li", {
+    key: i,
+    className: "flex gap-2"
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "text-violet-500"
+  }, "\xB7"), /*#__PURE__*/React.createElement("span", null, v)))))), analysis.key_points?.length > 0 && /*#__PURE__*/React.createElement(Card, {
     className: "p-4"
   }, /*#__PURE__*/React.createElement(SectionTitle, null, "\u8FD9\u9053\u9898\u5728\u8003\u4EC0\u4E48"), /*#__PURE__*/React.createElement("ul", {
     className: "space-y-1 text-sm text-slate-700"

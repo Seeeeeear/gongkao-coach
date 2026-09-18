@@ -411,10 +411,67 @@ if (!demoBtn) {
   demoBtn.dispatchEvent(new w.MouseEvent('click', { bubbles: true }))
   await new Promise((r) => setTimeout(r, 250))
   const text = rootEl.textContent
-  const need = ['比重变化两步法', '找部分增速', '抄进错题本', '出题人埋的坑']
+  const need = [
+    '比重变化两步法',
+    '找部分增速',
+    '抄进错题本',
+    '出题人埋的坑',
+    // 这轮新增的两层结构
+    '先看什么',
+    '这题在求',
+    '为什么想到用这招',
+    '这类题的通用骨架',
+    '比重变化判断',
+    '什么时候套它',
+    '常见变体',
+  ]
   const missing = need.filter((k) => !text.includes(k))
   if (missing.length) fail('示例分析渲染不完整，缺少：' + missing.join('、'))
-  else ok('示例分析完整渲染（快解步骤 / 坑 / 错题本一句话 都在）')
+  else ok('示例分析完整渲染（含新增的"为什么想到用这招"与"母题"两层）')
+}
+
+/* ---------- 2.5 字段缺失时不能崩（模型常漏字段） ---------- */
+
+{
+  // 直接往应用里塞一个"残缺"的分析结果，看界面会不会炸。
+  // 这是真实风险：模型偶尔不返回 reading / thinking_path / pattern。
+  const rich = {
+    id: 'partial1',
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    status: 'wrong',
+    saved: true,
+    module: 'data',
+    topic: '增长率比较',
+    questionText: '残缺测试题',
+    // 故意不提供 reading / thinking_path / pattern
+    analysis: {
+      module: 'data',
+      topic: '增长率比较',
+      error_types: ['stem_misread'],
+      error_summary: '测试缺字段',
+      fast_solution: { name: '测试快解', steps: ['一步'] },
+    },
+  }
+
+  const appP = await boot({ settings: { apiKey: 'sk-test-fake' }, records: [rich] })
+  await appP.clickTab('记录')
+  const card = appP.allButtons().find((b) => b.textContent.includes('测试缺字段'))
+  if (!card) {
+    fail('找不到残缺记录卡片')
+  } else {
+    card.dispatchEvent(new appP.w.MouseEvent('click', { bubbles: true }))
+    await new Promise((r) => setTimeout(r, 300))
+    const t = appP.rootEl.textContent
+    if (t.includes('页面出错了')) {
+      fail('缺少 reading/thinking_path/pattern 时详情页崩了（模型真会漏字段）')
+      console.log('   [诊断] ' + JSON.stringify(t.slice(0, 200)))
+    } else if (!t.includes('测试快解')) {
+      fail('残缺记录详情页没有正常渲染出已有内容')
+    } else {
+      ok('分析结果缺少新字段时不崩（缺什么就不显示什么）')
+    }
+  }
 }
 
 /* ------------------------- 3. 记录页两个视图 ------------------------- */
