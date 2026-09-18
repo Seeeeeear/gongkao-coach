@@ -9,7 +9,7 @@
  * 所以单题分析、申论批改这些需要联网的功能在鸿蒙上仍依赖网络，这是正常的。
  */
 
-const VERSION = 'v7'
+const VERSION = 'v8'
 const CACHE = `gk-coach-${VERSION}`
 
 // 应用外壳：首次安装时全部预缓存，之后离线也能启动

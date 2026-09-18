@@ -1,6 +1,6 @@
 /* 本文件由 scripts/build.mjs 从 app.jsx 自动生成，请勿直接修改。
  * 改代码请改 app.jsx，然后运行：node scripts/build.mjs
- * 生成时间：2026/9/18 18:31:31
+ * 生成时间：2026/9/18 22:14:27
  */
 /* ============================================================================
  * 考公做题分析器 —— 免构建单文件应用
@@ -1778,28 +1778,44 @@ function AnalysisResult({
   }, "\u2713 \u5DF2\u5B58\u5165\u9519\u9898\u672C"));
 }
 
+/** 默认框：居中、占满宽度的 92%、高度的 45%。
+ *  题目通常是"一行题干 + 几行选项"，横向铺满、纵向不用太高 ——
+ *  给个像样的初始框，比让用户从零拖起好得多。 */
+const DEFAULT_RECT = {
+  x: 0.04,
+  y: 0.28,
+  w: 0.92,
+  h: 0.45
+};
+const clamp01 = v => Math.max(0, Math.min(1, v));
+
 /**
  * 裁剪界面。
  *
- * 为什么必须有：拍一张照片常常框进好几道题，AI 会分析错那道；而且多余部分
- * 会让图变大、识别变慢。让用户框出"就是这一道"，是最直接的解法。
+ * 设计要点（第一版做错了，这是重做版）：
+ *   - **默认就有一个框**。第一版要求用户"从零拖一个框"，
+ *     手机上很难精确起始，而且一松手框就消失 —— 完全不可用。
+ *   - **四角可拖**调整大小，48px 触摸热区（视觉上只是小圆点）。
+ *   - **整块可拖**平移，方便整体微调。
+ *   - **框永不消失**：拖动只改边界，不会把框弄没。
  *
- * 交互设计（按手机操作习惯）：
- *   - 手指在图上拖，直接拉出一个框
- *   - 松手后可再拖重新框（不用先清除）
- *   - 不给四角手柄 —— 手机上太细，点不准；重拖一次更快
- *   - 没框选时默认用整张图（不强迫裁剪）
- *   - 显示实时百分比，让用户知道自己框了多大
+ * 实现上用「原生事件 + 指针捕获」而不是 React 的 onPointerXxx：
+ *   1. setPointerCapture 让手指移出图片范围后事件仍然送达（手机上很关键）
+ *   2. 绕开 React 合成事件在连续拖动场景下的时序问题
+ * 调试记录：用 onPointerMove 的版本，拖动后 rect 会变成畸形值、选框整个消失。
+ * 改成原生监听后正常 —— 这个坑值得记着。
  */
 function CropEditor({
   src,
   onConfirm,
-  onCancel,
-  busy
+  onCancel
 }) {
-  const [rect, setRect] = useState(null); // {x,y,w,h} 相对坐标 0~1
-  const [dragging, setDragging] = useState(null);
+  const [rect, setRect] = useState(DEFAULT_RECT);
+  const [dragMode, setDragMode] = useState(null);
   const boxRef = useRef(null);
+  const dragRef = useRef(null);
+  const rectRef = useRef(DEFAULT_RECT);
+  rectRef.current = rect;
 
   /** 把指针位置换算成图片内的相对坐标 */
   const toRelative = (clientX, clientY) => {
@@ -1809,93 +1825,226 @@ function CropEditor({
       y: 0
     };
     const b = el.getBoundingClientRect();
+    if (!b.width || !b.height) return {
+      x: 0,
+      y: 0
+    };
     return {
-      x: Math.max(0, Math.min(1, (clientX - b.left) / b.width)),
-      y: Math.max(0, Math.min(1, (clientY - b.top) / b.height))
+      x: clamp01((clientX - b.left) / b.width),
+      y: clamp01((clientY - b.top) / b.height)
     };
   };
-  const onDown = e => {
-    if (busy) return;
-    const p = toRelative(e.clientX, e.clientY);
-    setDragging({
-      sx: p.x,
-      sy: p.y
-    });
-    setRect(null);
-  };
-  const onMove = e => {
-    if (!dragging || busy) return;
-    // 阻止拖动时页面跟着滚
-    if (e.cancelable) e.preventDefault();
-    const p = toRelative(e.clientX, e.clientY);
-    setRect({
-      x: Math.min(dragging.sx, p.x),
-      y: Math.min(dragging.sy, p.y),
-      w: Math.abs(p.x - dragging.sx),
-      h: Math.abs(p.y - dragging.sy)
-    });
-  };
-  const onUp = () => setDragging(null);
 
-  // 框太小就当作没框（避免误触产生一个 2px 的框导致裁出废图）
-  const usable = rect && rect.w > 0.05 && rect.h > 0.05;
+  /** 纯函数：给定拖动模式和指针位置，算出新的 rect。不读外部 state */
+  const computeRect = (mode, p) => {
+    const d = dragRef.current;
+    if (!d) return rectRef.current;
+    const b = d.base;
+    if (mode === 'draw') {
+      return {
+        x: Math.min(d.sx, p.x),
+        y: Math.min(d.sy, p.y),
+        w: Math.abs(p.x - d.sx),
+        h: Math.abs(p.y - d.sy)
+      };
+    }
+    if (mode === 'move') {
+      const nx = clamp01(b.x + (p.x - d.sx));
+      const ny = clamp01(b.y + (p.y - d.sy));
+      return {
+        x: Math.min(nx, 1 - b.w),
+        y: Math.min(ny, 1 - b.h),
+        w: b.w,
+        h: b.h
+      };
+    }
+
+    // 拖角：只改被拖的那两条边，对边钉住
+    const left = b.x;
+    const right = b.x + b.w;
+    const top = b.y;
+    const bottom = b.y + b.h;
+    const MIN = 0.06; // 最小尺寸，防止拖成一条线
+
+    if (mode === 'nw') {
+      const nl = Math.min(p.x, right - MIN);
+      const nt = Math.min(p.y, bottom - MIN);
+      return {
+        x: nl,
+        y: nt,
+        w: right - nl,
+        h: bottom - nt
+      };
+    }
+    if (mode === 'ne') {
+      const nr = Math.max(p.x, left + MIN);
+      const nt = Math.min(p.y, bottom - MIN);
+      return {
+        x: left,
+        y: nt,
+        w: nr - left,
+        h: bottom - nt
+      };
+    }
+    if (mode === 'sw') {
+      const nl = Math.min(p.x, right - MIN);
+      const nb = Math.max(p.y, top + MIN);
+      return {
+        x: nl,
+        y: top,
+        w: right - nl,
+        h: nb - top
+      };
+    }
+    // se
+    const nr = Math.max(p.x, left + MIN);
+    const nb = Math.max(p.y, top + MIN);
+    return {
+      x: left,
+      y: top,
+      w: nr - left,
+      h: nb - top
+    };
+  };
+
+  /** 在元素上装原生指针事件，实现一次拖动 */
+  const attachDrag = mode => el => {
+    if (!el || el.__gkDragBound) return;
+    el.__gkDragBound = true;
+    el.addEventListener('pointerdown', e => {
+      e.preventDefault();
+      e.stopPropagation();
+      const p = toRelative(e.clientX, e.clientY);
+      dragRef.current = {
+        mode,
+        sx: p.x,
+        sy: p.y,
+        base: rectRef.current
+      };
+      setDragMode(mode);
+      if (mode === 'draw') setRect({
+        x: p.x,
+        y: p.y,
+        w: 0,
+        h: 0
+      });
+      // 指针捕获：手指移出这个元素后，事件仍然送到它这里
+      try {
+        el.setPointerCapture(e.pointerId);
+      } catch {
+        // 不支持捕获的环境退化为普通事件（仍可用，只是移出边界会断开）
+      }
+    });
+    el.addEventListener('pointermove', e => {
+      if (!dragRef.current) return;
+      e.preventDefault();
+      setRect(computeRect(dragRef.current.mode, toRelative(e.clientX, e.clientY)));
+    });
+    const stop = () => {
+      dragRef.current = null;
+      setDragMode(null);
+    };
+    el.addEventListener('pointerup', stop);
+    el.addEventListener('pointercancel', stop);
+  };
+
+  // 只在"拖出来的框太小"时才不接受；默认框和拖角结果都远大于阈值
+  const usable = rect.w > 0.08 && rect.h > 0.05;
+  const dragging = Boolean(dragMode);
   return /*#__PURE__*/React.createElement("div", {
     className: "space-y-3"
   }, /*#__PURE__*/React.createElement("div", {
     className: "flex items-start gap-2 rounded-xl bg-brand-50 p-3 text-sm text-brand-800"
   }, /*#__PURE__*/React.createElement("span", null, "\u2702\uFE0F"), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("b", null, "\u6846\u51FA\u4F60\u8981\u5206\u6790\u7684\u90A3\u9053\u9898"), /*#__PURE__*/React.createElement("div", {
     className: "mt-0.5 text-xs text-brand-700/80"
-  }, "\u7528\u624B\u6307\u5728\u56FE\u4E0A\u62D6\u4E00\u4E2A\u6846\u3002\u6846\u5F97\u51C6\uFF0CAI \u5C31\u4E0D\u4F1A\u5206\u6790\u9519\u9898\uFF0C\u8BC6\u522B\u4E5F\u66F4\u5FEB\u3002"))), /*#__PURE__*/React.createElement("div", {
+  }, "\u5DF2\u7ECF\u7ED9\u4F60\u6846\u597D\u4E86\u3002\u62D6", /*#__PURE__*/React.createElement("b", null, "\u56DB\u4E2A\u89D2"), "\u8C03\u6574\u8303\u56F4\uFF0C\u62D6", /*#__PURE__*/React.createElement("b", null, "\u6846\u91CC\u9762"), "\u53EF\u4EE5\u6574\u4F53\u632A\u52A8\u3002"))), /*#__PURE__*/React.createElement("div", {
     ref: boxRef,
-    onPointerDown: e => onDown(e),
-    onPointerMove: e => onMove(e),
-    onPointerUp: onUp,
-    onPointerCancel: onUp,
-    onPointerLeave: onUp,
-    className: "relative select-none overflow-hidden rounded-xl bg-slate-900",
-    style: {
-      touchAction: 'none',
-      cursor: 'crosshair'
-    }
+    "data-crop-root": "1",
+    className: "relative select-none overflow-hidden rounded-xl bg-slate-900"
   }, /*#__PURE__*/React.createElement("img", {
+    ref: attachDrag('draw'),
     src: src,
     alt: "\u5F85\u88C1\u526A",
     className: "block w-full",
-    draggable: false
-  }), !usable && /*#__PURE__*/React.createElement("div", {
-    className: "pointer-events-none absolute inset-0 flex items-center justify-center bg-slate-900/25"
-  }, /*#__PURE__*/React.createElement("span", {
-    className: "rounded-full bg-slate-900/70 px-3 py-1.5 text-xs text-white"
-  }, "\u624B\u6307\u5728\u56FE\u4E0A\u62D6\u52A8\uFF0C\u6846\u51FA\u8FD9\u9053\u9898")), usable && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    draggable: false,
+    style: {
+      touchAction: 'none'
+    }
+  }), usable && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
     className: "pointer-events-none absolute border-2 border-brand-400",
     style: {
       left: `${rect.x * 100}%`,
       top: `${rect.y * 100}%`,
       width: `${rect.w * 100}%`,
       height: `${rect.h * 100}%`,
-      boxShadow: '0 0 0 9999px rgba(15,23,42,0.55)'
+      boxShadow: '0 0 0 9999px rgba(15,23,42,0.6)'
     }
   }), /*#__PURE__*/React.createElement("div", {
-    className: "pointer-events-none absolute rounded bg-brand-600 px-1.5 py-0.5 text-[10px] font-medium text-white",
+    ref: attachDrag('move'),
+    className: "absolute",
     style: {
       left: `${rect.x * 100}%`,
       top: `${rect.y * 100}%`,
-      transform: 'translateY(-100%)'
+      width: `${rect.w * 100}%`,
+      height: `${rect.h * 100}%`,
+      touchAction: 'none',
+      cursor: 'move'
+    }
+  }), [{
+    key: 'nw',
+    cls: '-left-6 -top-6',
+    cursor: 'nwse-resize'
+  }, {
+    key: 'ne',
+    cls: '-right-6 -top-6',
+    cursor: 'nesw-resize'
+  }, {
+    key: 'sw',
+    cls: '-bottom-6 -left-6',
+    cursor: 'nesw-resize'
+  }, {
+    key: 'se',
+    cls: '-bottom-6 -right-6',
+    cursor: 'nwse-resize'
+  }].map(c => /*#__PURE__*/React.createElement("div", {
+    key: c.key,
+    ref: attachDrag(c.key),
+    className: 'absolute flex h-12 w-12 items-center justify-center ' + c.cls,
+    style: {
+      touchAction: 'none',
+      cursor: c.cursor
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "pointer-events-none h-3.5 w-3.5 rounded-full border-2 border-white bg-brand-600 shadow"
+  }))), /*#__PURE__*/React.createElement("div", {
+    className: "pointer-events-none absolute rounded bg-slate-900/85 px-1.5 py-0.5 text-[10px] font-medium text-white",
+    style: {
+      left: `${rect.x * 100}%`,
+      top: `${rect.y * 100}%`,
+      transform: 'translateY(-140%)'
     }
   }, "\u5DF2\u9009 ", Math.round(rect.w * 100), "% \xD7 ", Math.round(rect.h * 100), "%"))), /*#__PURE__*/React.createElement("div", {
     className: "flex gap-2"
-  }, usable && /*#__PURE__*/React.createElement("button", {
-    onClick: () => setRect(null),
-    disabled: busy,
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => setRect(DEFAULT_RECT),
+    disabled: dragging,
     className: "flex-1 rounded-xl bg-slate-100 py-3 text-sm font-medium text-slate-700"
-  }, "\u91CD\u65B0\u6846\u9009"), /*#__PURE__*/React.createElement("button", {
+  }, "\u91CD\u7F6E"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setRect({
+      x: 0,
+      y: 0,
+      w: 1,
+      h: 1
+    }),
+    disabled: dragging,
+    className: "flex-1 rounded-xl bg-slate-100 py-3 text-sm font-medium text-slate-700"
+  }, "\u7528\u6574\u5F20\u56FE"), /*#__PURE__*/React.createElement("button", {
     onClick: onCancel,
-    disabled: busy,
+    disabled: dragging,
     className: "flex-1 rounded-xl bg-slate-100 py-3 text-sm font-medium text-slate-700"
   }, "\u53D6\u6D88")), /*#__PURE__*/React.createElement(PrimaryButton, {
-    onClick: () => onConfirm(usable ? rect : null),
-    loading: busy
-  }, usable ? '就用这块，开始分析' : '不裁了，用整张图'));
+    onClick: () => onConfirm(usable ? rect : null)
+  }, usable ? '就用这块，开始分析' : '用整张图分析'));
 }
 
 /**

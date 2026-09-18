@@ -333,68 +333,152 @@ await clickTab('分析')
       return origRect ? origRect.call(this) : { left: 0, top: 0, width: 0, height: 0, right: 0, bottom: 0, x: 0, y: 0, toJSON() {} }
     }
 
-    const cropBox = rootEl.querySelector('[style*="touch-action"]')
+    // 用语义化的 data 属性选中裁剪容器。
+    // 不能靠 [style*=touch-action]：图片自己也带这个样式，会先抓到图片。
+    const cropBox = rootEl.querySelector('[data-crop-root]')
     if (!cropBox) {
       fail('裁剪界面里找不到可拖拽的图片容器')
     } else {
-      const fireP = (type, x, y) => {
+      const fireP = (el, type, x, y) => {
         let ev
         try {
           ev = new w.PointerEvent(type, { bubbles: true, clientX: x, clientY: y })
         } catch {
           ev = new w.MouseEvent(type, { bubbles: true, clientX: x, clientY: y })
         }
-        cropBox.dispatchEvent(ev)
+        el.dispatchEvent(ev)
       }
 
-      // 框选 50%×50%（从 0,0 拖到 100,100，容器 200×200）
-      fireP('pointerdown', 0, 0)
-      await new Promise((r) => setTimeout(r, 120))
-      fireP('pointermove', 100, 100)
-      await new Promise((r) => setTimeout(r, 120))
-      fireP('pointerup', 100, 100)
-      await new Promise((r) => setTimeout(r, 400))
+      // 容器 200×200；相对坐标 (x%) = clientX / 200
+      const pct = (v) => Math.round(v * 200)
 
+      // ① 进界面就应该已经有默认框 —— 用户抱怨过"要从零拖一个框、很难唤起"
       t = rootEl.textContent
       if (!t.includes('已选')) {
-        fail('拖动后没有显示选框（裁剪交互没生效）')
-        console.log('   [诊断] 拖动后页面文字前 220 字：' + JSON.stringify(t.slice(0, 220)))
+        fail('进入裁剪界面没有默认选框（用户要求默认就要有框）')
+        console.log('   [诊断] ' + JSON.stringify(t.slice(0, 200)))
+      } else {
+        ok('进入裁剪界面就带默认选框（不用从零拖）')
+      }
+
+      // ② 四角手柄必须存在
+      const allDivs = [...cropBox.querySelectorAll('div')]
+      const handles = allDivs.filter(
+        (d) =>
+          (d.getAttribute('style') || '').includes('resize') ||
+          (d.className || '').includes('resize'),
+      )
+      if (handles.length !== 4) {
+        fail(`四角手柄应有 4 个，实际 ${handles.length} 个`)
         console.log(
-          '   [诊断] 容器上绑定的事件类型：' +
-            JSON.stringify(Object.keys(cropBox).filter((k) => k.startsWith('on'))).slice(0, 200),
-        )
-        console.log(
-          '   [诊断] 容器 tagName/class：' +
-            cropBox.tagName +
-            ' / ' +
-            (cropBox.className || '(无 class)'),
+          '   [诊断] 裁剪容器内的 div（共 ' +
+            allDivs.length +
+            ' 个）：' +
+            allDivs
+              .map((d) => JSON.stringify({ cls: d.className, style: d.getAttribute('style') }))
+              .slice(0, 8)
+              .join(' | '),
         )
       } else {
-        ok('拖动可以框选（显示实时比例）')
+        ok('四个角都有可拖手柄')
+      }
 
-        if (!t.includes('重新框选')) fail('框选后没有"重新框选"按钮')
-        else ok('框选后出现「重新框选」按钮')
-
-        const okBtn = allButtons().find((b) => b.textContent.includes('就用这块'))
-        if (!okBtn) {
-          fail('找不到"就用这块，开始分析"按钮')
+      // ③ 拖右下角 → 框应变大
+      const readSize = () => {
+        const m = rootEl.textContent.match(/已选 (\d+)% × (\d+)%/)
+        return m ? { w: Number(m[1]), h: Number(m[2]) } : null
+      }
+      const before = readSize()
+      if (!before) {
+        fail('读不到选框尺寸标签')
+      } else {
+        const se = handles.find((d) => (d.getAttribute('style') || '').includes('nwse-resize'))
+        if (!se) {
+          fail('找不到右下角手柄')
         } else {
-          okBtn.click()
+          // 注意：断言消息里的数字要在改动变量之前先算好，
+          // 否则会打印出"改完之后"的值，看起来像 bug（真踩过）
+          const beforeW = before.w
+          const beforeH = before.h
+
+          fireP(se, 'pointerdown', pct(0.96), pct(0.73))
+          await new Promise((r) => setTimeout(r, 120))
+          fireP(se, 'pointermove', pct(0.99), pct(0.95))
+          await new Promise((r) => setTimeout(r, 120))
+          fireP(se, 'pointerup', pct(0.99), pct(0.95))
           await new Promise((r) => setTimeout(r, 300))
-          t = rootEl.textContent
-          if (!t.includes('已裁剪')) {
-            fail('确认裁剪后没有标记为「已裁剪」')
+
+          const after = readSize()
+          if (!after) {
+            fail('拖角后选框消失了 —— 这正是用户抱怨的"框容易丢失"')
+          } else if (!(after.h > beforeH)) {
+            fail(`拖右下角后高度应变大：${beforeH}% → ${after.h}%`)
           } else {
-            ok('确认裁剪后回到预览，并标记「✂️ 已裁剪」')
+            ok(`拖右下角可以调整大小（${beforeW}%×${beforeH}% → ${after.w}%×${after.h}%）`)
           }
-          // 裁剪出来的应该不是原图（说明确实走了裁剪分支）
-          const shownImg = rootEl.querySelector('img[alt="题目"]')
-          const src = shownImg?.getAttribute('src') || ''
-          if (!src.includes('CROPPED')) {
-            fail('确认裁剪后展示的不是裁剪结果：' + src.slice(0, 40))
+        }
+
+        // ④ 拖框内 → 整体平移，尺寸不变
+        const sizeBeforeMove = readSize()
+        const mover = [...cropBox.querySelectorAll('div')].find(
+          (d) => d.style && d.style.cursor === 'move',
+        )
+        if (!mover) {
+          fail('找不到可整体拖动的框内区域')
+        } else {
+          fireP(mover, 'pointerdown', pct(0.5), pct(0.5))
+          await new Promise((r) => setTimeout(r, 120))
+          fireP(mover, 'pointermove', pct(0.4), pct(0.4))
+          await new Promise((r) => setTimeout(r, 120))
+          fireP(mover, 'pointerup', pct(0.4), pct(0.4))
+          await new Promise((r) => setTimeout(r, 300))
+          const sizeAfterMove = readSize()
+          if (!sizeAfterMove) {
+            fail('拖动后选框消失了')
+          } else if (
+            sizeAfterMove.w !== sizeBeforeMove.w ||
+            sizeAfterMove.h !== sizeBeforeMove.h
+          ) {
+            fail(`整体平移不应改变尺寸：${sizeBeforeMove.w}×${sizeBeforeMove.h} → ${sizeAfterMove.w}×${sizeAfterMove.h}`)
           } else {
-            ok('展示的是裁剪后的图（不是原图）')
+            ok('拖框内可以整体平移（尺寸保持不变）')
           }
+        }
+      }
+
+      // ⑤ 重置按钮应把框还原
+      const resetBtn = allButtons().find((b) => b.textContent.trim() === '重置')
+      if (!resetBtn) {
+        fail('找不到「重置」按钮')
+      } else {
+        resetBtn.click()
+        await new Promise((r) => setTimeout(r, 300))
+        const afterReset = readSize()
+        if (!afterReset) fail('重置后选框丢了')
+        else if (afterReset.w !== 92 || afterReset.h !== 45)
+          fail(`重置后应回到默认 92%×45%，实际 ${afterReset.w}%×${afterReset.h}%`)
+        else ok('「重置」能把框还原成默认大小')
+      }
+
+      // ⑥ 确认裁剪并检查结果
+      const okBtn = allButtons().find((b) => b.textContent.includes('就用这块'))
+      if (!okBtn) {
+        fail('找不到"就用这块，开始分析"按钮')
+      } else {
+        okBtn.click()
+        await new Promise((r) => setTimeout(r, 300))
+        t = rootEl.textContent
+        if (!t.includes('已裁剪')) {
+          fail('确认裁剪后没有标记为「已裁剪」')
+        } else {
+          ok('确认裁剪后回到预览，并标记「✂️ 已裁剪」')
+        }
+        const shownImg = rootEl.querySelector('img[alt="题目"]')
+        const src = shownImg?.getAttribute('src') || ''
+        if (!src.includes('CROPPED')) {
+          fail('确认裁剪后展示的不是裁剪结果：' + src.slice(0, 40))
+        } else {
+          ok('展示的是裁剪后的图（不是原图）')
         }
       }
     }
