@@ -74,6 +74,54 @@ async function boot({ records = null, settings = null } = {}) {
   w.confirm = () => true
   w.URL.createObjectURL = () => 'blob:test'
   w.URL.revokeObjectURL = () => {}
+
+  /**
+   * canvas / Image 垫片。
+   * jsdom 不带 canvas（getContext 返回 null、没有 toDataURL），
+   * 而裁剪流程靠它出图。这里给一个最小实现，让"裁剪接线是否正确"
+   * 可以被验证 —— 注意这**测不出真实裁剪效果**，只能测流程通不通。
+   */
+  w.HTMLCanvasElement.prototype.getContext = function () {
+    return {
+      fillStyle: '#fff',
+      fillRect() {},
+      drawImage() {},
+    }
+  }
+  w.HTMLCanvasElement.prototype.toDataURL = function () {
+    return 'data:image/jpeg;base64,CROPPED'
+  }
+  // 让 new Image() 立刻 onload，并带一个假的尺寸
+  Object.defineProperty(w, 'Image', {
+    configurable: true,
+    value: class FakeImage {
+      constructor() {
+        this.width = 1200
+        this.height = 1600
+        this.onload = null
+        this.onerror = null
+      }
+      set src(v) {
+        this._src = v
+        setTimeout(() => this.onload && this.onload(), 0)
+      }
+      get src() {
+        return this._src
+      }
+    },
+  })
+  // FileReader 也需要能吐出 dataURL
+  Object.defineProperty(w, 'FileReader', {
+    configurable: true,
+    value: class FakeFileReader {
+      readAsDataURL() {
+        setTimeout(() => {
+          this.result = 'data:image/jpeg;base64,RAW'
+          this.onload && this.onload()
+        }, 0)
+      }
+    },
+  })
   // navigator.clipboard 在 jsdom 里没有，给个假的
   Object.defineProperty(w.navigator, 'clipboard', {
     value: { writeText: async () => {} },
@@ -220,6 +268,135 @@ await clickTab('分析')
       fail('切到无流派模块时没有给出说明')
     } else {
       ok('无流派模块显示「暂时没有方法流派包」说明（不做无用 UI）')
+    }
+  }
+}
+
+/* ---------- 1.6 拍题：不能强制进系统相册（用户反馈的痛点） ---------- */
+
+{
+  await clickTab('分析')
+  // 切回资料分析，保证在拍题模式
+  const dataBtn = allButtons().find((b) => b.textContent.trim() === '资料分析')
+  dataBtn?.dispatchEvent(new w.MouseEvent('click', { bubbles: true }))
+  await new Promise((r) => setTimeout(r, 150))
+
+  const fileInputs = [...rootEl.querySelectorAll('input[type="file"]')]
+  if (!fileInputs.length) {
+    fail('分析页找不到文件选择框')
+  } else {
+    // 关键：带 capture 属性会强制调起相机并把照片存进系统相册，
+    // 而网页无权删除相册照片 —— 会把用户相册搞乱。
+    const withCapture = fileInputs.filter((i) => i.hasAttribute('capture'))
+    if (withCapture.length) {
+      fail(
+        `文件选择框带 capture 属性（${withCapture.length} 个）—— 会导致照片被塞进系统相册`,
+      )
+    } else {
+      ok('文件选择框没有强制调相机（照片不会自动进系统相册）')
+    }
+
+    const acceptsImage = fileInputs.some((i) => (i.getAttribute('accept') || '').includes('image'))
+    if (!acceptsImage) fail('文件选择框没有限定图片类型')
+    else ok('文件选择框限定为图片')
+  }
+
+  const cropHint = rootEl.textContent
+  if (!cropHint.includes('拍完会让你框出这道题')) {
+    fail('拍题入口没有提示"拍完要裁剪"')
+  } else {
+    ok('拍题入口提示了裁剪步骤')
+  }
+
+  /* ---- 走一遍完整裁剪流程 ---- */
+
+  const input = fileInputs[0]
+  const fakeFile = { name: 'q.jpg', type: 'image/jpeg', size: 123456 }
+  Object.defineProperty(input, 'files', { value: [fakeFile], configurable: true })
+  input.dispatchEvent(new w.Event('change', { bubbles: true }))
+  await new Promise((r) => setTimeout(r, 250))
+
+  let t = rootEl.textContent
+  if (!t.includes('框出你要分析的那道题')) {
+    fail('选图后没有进入裁剪界面')
+  } else {
+    ok('选图后进入裁剪界面')
+
+    // 给裁剪容器一个固定的显示区域，才能换算指针坐标。
+    // 直接改 Element 原型 —— jsdom 默认返回全 0，
+    // 若只改单个元素，某些情况下（元素被重渲染替换）会失效。
+    const origRect = w.Element.prototype.getBoundingClientRect
+    w.Element.prototype.getBoundingClientRect = function () {
+      if (this.style && String(this.style.touchAction) === 'none') {
+        return { left: 0, top: 0, width: 200, height: 200, right: 200, bottom: 200, x: 0, y: 0, toJSON() {} }
+      }
+      return origRect ? origRect.call(this) : { left: 0, top: 0, width: 0, height: 0, right: 0, bottom: 0, x: 0, y: 0, toJSON() {} }
+    }
+
+    const cropBox = rootEl.querySelector('[style*="touch-action"]')
+    if (!cropBox) {
+      fail('裁剪界面里找不到可拖拽的图片容器')
+    } else {
+      const fireP = (type, x, y) => {
+        let ev
+        try {
+          ev = new w.PointerEvent(type, { bubbles: true, clientX: x, clientY: y })
+        } catch {
+          ev = new w.MouseEvent(type, { bubbles: true, clientX: x, clientY: y })
+        }
+        cropBox.dispatchEvent(ev)
+      }
+
+      // 框选 50%×50%（从 0,0 拖到 100,100，容器 200×200）
+      fireP('pointerdown', 0, 0)
+      await new Promise((r) => setTimeout(r, 120))
+      fireP('pointermove', 100, 100)
+      await new Promise((r) => setTimeout(r, 120))
+      fireP('pointerup', 100, 100)
+      await new Promise((r) => setTimeout(r, 400))
+
+      t = rootEl.textContent
+      if (!t.includes('已选')) {
+        fail('拖动后没有显示选框（裁剪交互没生效）')
+        console.log('   [诊断] 拖动后页面文字前 220 字：' + JSON.stringify(t.slice(0, 220)))
+        console.log(
+          '   [诊断] 容器上绑定的事件类型：' +
+            JSON.stringify(Object.keys(cropBox).filter((k) => k.startsWith('on'))).slice(0, 200),
+        )
+        console.log(
+          '   [诊断] 容器 tagName/class：' +
+            cropBox.tagName +
+            ' / ' +
+            (cropBox.className || '(无 class)'),
+        )
+      } else {
+        ok('拖动可以框选（显示实时比例）')
+
+        if (!t.includes('重新框选')) fail('框选后没有"重新框选"按钮')
+        else ok('框选后出现「重新框选」按钮')
+
+        const okBtn = allButtons().find((b) => b.textContent.includes('就用这块'))
+        if (!okBtn) {
+          fail('找不到"就用这块，开始分析"按钮')
+        } else {
+          okBtn.click()
+          await new Promise((r) => setTimeout(r, 300))
+          t = rootEl.textContent
+          if (!t.includes('已裁剪')) {
+            fail('确认裁剪后没有标记为「已裁剪」')
+          } else {
+            ok('确认裁剪后回到预览，并标记「✂️ 已裁剪」')
+          }
+          // 裁剪出来的应该不是原图（说明确实走了裁剪分支）
+          const shownImg = rootEl.querySelector('img[alt="题目"]')
+          const src = shownImg?.getAttribute('src') || ''
+          if (!src.includes('CROPPED')) {
+            fail('确认裁剪后展示的不是裁剪结果：' + src.slice(0, 40))
+          } else {
+            ok('展示的是裁剪后的图（不是原图）')
+          }
+        }
+      }
     }
   }
 }
@@ -443,6 +620,48 @@ await app2.clickTab('记录')
         ok('满分选项包含国考大作文常见分值（35 / 40）')
       }
     }
+  }
+}
+
+/* -------- 6.8 题图清理规则：已收藏永久保留，未收藏只留最近 100 张 -------- */
+
+{
+  // pruneUnsavedImages 是函数声明，eval 后可在全局取到
+  if (typeof app2.w.pruneUnsavedImages !== 'function') {
+    fail('取不到 pruneUnsavedImages（可能被改成了 const/let）')
+  } else {
+    const mkRec = (i, savedFlag) => ({
+      id: 'img' + i,
+      createdAt: 1000 + i, // 递增，i 越大越新
+      saved: savedFlag,
+      module: 'data',
+      image: 'data:image/jpeg;base64,AAAA',
+      analysis: { module: 'data', error_types: [] },
+    })
+
+    // 105 条未收藏 + 3 条已收藏。未收藏里最旧的是 img0..img4
+    const recs = []
+    for (let i = 0; i < 105; i++) recs.push(mkRec(i, false))
+    recs.push(mkRec(1001, true))
+    recs.push(mkRec(1002, true))
+    recs.push(mkRec(1003, true))
+
+    const dropped = await app2.w.pruneUnsavedImages(recs, 100)
+
+    if (dropped !== 5) fail(`应清掉 5 张未收藏的题图，实际 ${dropped} 张`)
+    else ok('未收藏的题图按"只留最近 100 张"清理（清掉 5 张）')
+
+    // 已收藏的三条必须一张都没被清
+    const savedStillHasImage = recs.filter((r) => r.saved).every((r) => Boolean(r.image))
+    if (!savedStillHasImage) fail('已收藏的题图被清掉了 —— 违反"收藏后永久保留"规则')
+    else ok('已收藏的题图完全没被清理（符合你定的规则）')
+
+    // 留下的是最新那批：img5..img104 应该有图，img0..img4 应该被清
+    const oldestCleared = [0, 1, 2, 3, 4].every((i) => recs[i].image === null)
+    const newestKept = [5, 104].every((i) => Boolean(recs[i].image))
+    if (!oldestCleared) fail('最旧的未收藏题图没有被清理（清理顺序不对）')
+    else if (!newestKept) fail('最新的未收藏题图被误清')
+    else ok('清理顺序正确：清最旧的，留最新的')
   }
 }
 

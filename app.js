@@ -1,6 +1,6 @@
 /* 本文件由 scripts/build.mjs 从 app.jsx 自动生成，请勿直接修改。
  * 改代码请改 app.jsx，然后运行：node scripts/build.mjs
- * 生成时间：2026/9/17 23:53:42
+ * 生成时间：2026/9/18 18:29:50
  */
 /* ============================================================================
  * 考公做题分析器 —— 免构建单文件应用
@@ -1111,6 +1111,54 @@ function compressImage(file, maxSide = 1600, quality = 0.82) {
   });
 }
 
+/**
+ * 按比例裁一块图（矩形用 0~1 的相对坐标，方便和显示尺寸解耦）。
+ * 裁剪后再压缩一次，让传给 AI 的图更小、更干净。
+ */
+function cropDataUrl(dataUrl, rect, quality = 0.86) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onerror = () => reject(new Error('图片解析失败'));
+    img.onload = () => {
+      const sx = Math.round(Math.max(0, Math.min(1, rect.x)) * img.width);
+      const sy = Math.round(Math.max(0, Math.min(1, rect.y)) * img.height);
+      const sw = Math.max(8, Math.round(Math.max(0.02, Math.min(1, rect.w)) * img.width));
+      const sh = Math.max(8, Math.round(Math.max(0.02, Math.min(1, rect.h)) * img.height));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.min(sw, img.width - sx);
+      canvas.height = Math.min(sh, img.height - sy);
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, sx, sy, canvas.width, canvas.height, 0, 0, canvas.width, canvas.height);
+      resolve(canvas.toDataURL('image/jpeg', quality));
+    };
+    img.src = dataUrl;
+  });
+}
+
+/**
+ * 清理没收藏的记录里的题图，控制存储占用。
+ *
+ * 规则（用户定的）：
+ *   - 已加入错题本的题：原图永久保留，只有用户主动删除才消失
+ *   - 只是分析过、没收藏的：只留最近 maxKeep 张，更早的清掉
+ *
+ * 注意：同时清掉记录里的 image 和 draftImage 两个字段
+ * （draftImage 是拍完还没分析时暂存的，防止中途退出留下垃圾）。
+ */
+async function pruneUnsavedImages(records, maxKeep = 100) {
+  const targets = records.filter(r => !r.saved && (r.image || r.draftImage)).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  if (targets.length <= maxKeep) return 0;
+  const drop = targets.slice(maxKeep);
+  for (const r of drop) {
+    r.image = null;
+    r.draftImage = null;
+    await dbPutRecord(r);
+  }
+  return drop.length;
+}
+
 /* ==========================================================================
  * §5 示例数据 —— 不配 API Key 也能看到分析长什么样
  * 用途：① 新用户先看效果，决定值不值得用 ② 开发者调界面时不用烧 token
@@ -1608,6 +1656,163 @@ function AnalysisResult({
     className: "rounded-xl bg-emerald-50 p-3 text-center text-sm font-medium text-emerald-700"
   }, "\u2713 \u5DF2\u5B58\u5165\u9519\u9898\u672C"));
 }
+
+/**
+ * 裁剪界面。
+ *
+ * 为什么必须有：拍一张照片常常框进好几道题，AI 会分析错那道；而且多余部分
+ * 会让图变大、识别变慢。让用户框出"就是这一道"，是最直接的解法。
+ *
+ * 交互设计（按手机操作习惯）：
+ *   - 手指在图上拖，直接拉出一个框
+ *   - 松手后可再拖重新框（不用先清除）
+ *   - 不给四角手柄 —— 手机上太细，点不准；重拖一次更快
+ *   - 没框选时默认用整张图（不强迫裁剪）
+ *   - 显示实时百分比，让用户知道自己框了多大
+ */
+function CropEditor({
+  src,
+  onConfirm,
+  onCancel,
+  busy
+}) {
+  const [rect, setRect] = useState(null); // {x,y,w,h} 相对坐标 0~1
+  const [dragging, setDragging] = useState(null);
+  const boxRef = useRef(null);
+
+  /** 把指针位置换算成图片内的相对坐标 */
+  const toRelative = (clientX, clientY) => {
+    const el = boxRef.current;
+    if (!el) return {
+      x: 0,
+      y: 0
+    };
+    const b = el.getBoundingClientRect();
+    return {
+      x: Math.max(0, Math.min(1, (clientX - b.left) / b.width)),
+      y: Math.max(0, Math.min(1, (clientY - b.top) / b.height))
+    };
+  };
+  const onDown = e => {
+    if (busy) return;
+    const p = toRelative(e.clientX, e.clientY);
+    setDragging({
+      sx: p.x,
+      sy: p.y
+    });
+    setRect(null);
+  };
+  const onMove = e => {
+    if (!dragging || busy) return;
+    // 阻止拖动时页面跟着滚
+    if (e.cancelable) e.preventDefault();
+    const p = toRelative(e.clientX, e.clientY);
+    setRect({
+      x: Math.min(dragging.sx, p.x),
+      y: Math.min(dragging.sy, p.y),
+      w: Math.abs(p.x - dragging.sx),
+      h: Math.abs(p.y - dragging.sy)
+    });
+  };
+  const onUp = () => setDragging(null);
+
+  // 框太小就当作没框（避免误触产生一个 2px 的框导致裁出废图）
+  const usable = rect && rect.w > 0.05 && rect.h > 0.05;
+  return /*#__PURE__*/React.createElement("div", {
+    className: "space-y-3"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex items-start gap-2 rounded-xl bg-brand-50 p-3 text-sm text-brand-800"
+  }, /*#__PURE__*/React.createElement("span", null, "\u2702\uFE0F"), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("b", null, "\u6846\u51FA\u4F60\u8981\u5206\u6790\u7684\u90A3\u9053\u9898"), /*#__PURE__*/React.createElement("div", {
+    className: "mt-0.5 text-xs text-brand-700/80"
+  }, "\u7528\u624B\u6307\u5728\u56FE\u4E0A\u62D6\u4E00\u4E2A\u6846\u3002\u6846\u5F97\u51C6\uFF0CAI \u5C31\u4E0D\u4F1A\u5206\u6790\u9519\u9898\uFF0C\u8BC6\u522B\u4E5F\u66F4\u5FEB\u3002"))), /*#__PURE__*/React.createElement("div", {
+    ref: boxRef,
+    onPointerDown: e => onDown(e),
+    onPointerMove: e => onMove(e),
+    onPointerUp: onUp,
+    onPointerCancel: onUp,
+    onPointerLeave: onUp,
+    className: "relative select-none overflow-hidden rounded-xl bg-slate-900",
+    style: {
+      touchAction: 'none',
+      cursor: 'crosshair'
+    }
+  }, /*#__PURE__*/React.createElement("img", {
+    src: src,
+    alt: "\u5F85\u88C1\u526A",
+    className: "block w-full",
+    draggable: false
+  }), !usable && /*#__PURE__*/React.createElement("div", {
+    className: "pointer-events-none absolute inset-0 flex items-center justify-center bg-slate-900/25"
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "rounded-full bg-slate-900/70 px-3 py-1.5 text-xs text-white"
+  }, "\u624B\u6307\u5728\u56FE\u4E0A\u62D6\u52A8\uFF0C\u6846\u51FA\u8FD9\u9053\u9898")), usable && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    className: "pointer-events-none absolute border-2 border-brand-400",
+    style: {
+      left: `${rect.x * 100}%`,
+      top: `${rect.y * 100}%`,
+      width: `${rect.w * 100}%`,
+      height: `${rect.h * 100}%`,
+      boxShadow: '0 0 0 9999px rgba(15,23,42,0.55)'
+    }
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "pointer-events-none absolute rounded bg-brand-600 px-1.5 py-0.5 text-[10px] font-medium text-white",
+    style: {
+      left: `${rect.x * 100}%`,
+      top: `${rect.y * 100}%`,
+      transform: 'translateY(-100%)'
+    }
+  }, "\u5DF2\u9009 ", Math.round(rect.w * 100), "% \xD7 ", Math.round(rect.h * 100), "%"))), /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-2"
+  }, usable && /*#__PURE__*/React.createElement("button", {
+    onClick: () => setRect(null),
+    disabled: busy,
+    className: "flex-1 rounded-xl bg-slate-100 py-3 text-sm font-medium text-slate-700"
+  }, "\u91CD\u65B0\u6846\u9009"), /*#__PURE__*/React.createElement("button", {
+    onClick: onCancel,
+    disabled: busy,
+    className: "flex-1 rounded-xl bg-slate-100 py-3 text-sm font-medium text-slate-700"
+  }, "\u53D6\u6D88")), /*#__PURE__*/React.createElement(PrimaryButton, {
+    onClick: () => onConfirm(usable ? rect : null),
+    loading: busy
+  }, usable ? '就用这块，开始分析' : '不裁了，用整张图'));
+}
+
+/**
+ * 记录里的题图。
+ * 默认收起（不占屏幕），点开看原题。已收藏的题原图永久保留，
+ * 所以给一个「删掉原图」的出口 —— 永久保留指的是"不自动清理"，不是"删不掉"。
+ */
+function RecordImage({
+  src,
+  onDelete
+}) {
+  const [open, setOpen] = useState(false);
+  return /*#__PURE__*/React.createElement(Card, {
+    className: "p-3.5"
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => setOpen(v => !v),
+    className: "press-flat flex w-full items-center gap-2 text-left"
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "text-base leading-none"
+  }, "\uD83D\uDDBC"), /*#__PURE__*/React.createElement("span", {
+    className: "flex-1 text-sm font-medium text-slate-600"
+  }, open ? '收起原题图片' : '查看原题图片'), /*#__PURE__*/React.createElement("span", {
+    className: "text-xs text-slate-400"
+  }, open ? '▾' : '▸')), open && /*#__PURE__*/React.createElement("div", {
+    className: "mt-3 space-y-2"
+  }, /*#__PURE__*/React.createElement("img", {
+    src: src,
+    alt: "\u539F\u9898",
+    className: "w-full rounded-xl bg-slate-50"
+  }), onDelete && /*#__PURE__*/React.createElement("button", {
+    onClick: () => {
+      if (confirm('删掉这张原题图片？文字分析会保留，只是以后看不到原图了。')) {
+        onDelete();
+      }
+    },
+    className: "w-full rounded-xl bg-slate-100 py-2 text-xs font-medium text-slate-500"
+  }, "\u5220\u6389\u539F\u56FE\uFF08\u6587\u5B57\u5206\u6790\u4FDD\u7559\uFF09")));
+}
 function CapturePage({
   onOpenDetail,
   gotoEssay
@@ -1616,7 +1821,8 @@ function CapturePage({
     settings,
     create,
     patch,
-    showToast
+    showToast,
+    records
   } = useApp();
   const [mode, setMode] = useState('photo');
   const [image, setImage] = useState(null);
@@ -1633,6 +1839,10 @@ function CapturePage({
   const [savedId, setSavedId] = useState(null);
   // 分析完自动留档产生的那条记录 id（加入错题本时复用它，避免重复入库）
   const [draftId, setDraftId] = useState(null);
+  // 裁剪阶段：rawImage 是刚从相册/相机拿到的图，还没裁剪
+  const [rawImage, setRawImage] = useState(null);
+  const [cropping, setCropping] = useState(false);
+  const [cropped, setCropped] = useState(false);
   const fileRef = useRef(null);
   const onPickFile = async e => {
     const file = e.target.files?.[0];
@@ -1640,12 +1850,36 @@ function CapturePage({
     setErr('');
     try {
       const dataUrl = await compressImage(file);
-      setImage(dataUrl);
+      // 不直接拿去分析，先进裁剪阶段 —— 让用户框出"就是这一道"
+      setRawImage(dataUrl);
+      setCropping(true);
+      setImage(null);
+      setCropped(false);
       setAnalysis(null);
       setSavedId(null);
+      setDraftId(null);
     } catch (e2) {
       setErr(e2.message);
     }
+  };
+
+  /** 裁剪确认：rect 为 null 表示用整张图 */
+  const onCropConfirm = async rect => {
+    if (!rawImage) return;
+    setErr('');
+    try {
+      const out = rect ? await cropDataUrl(rawImage, rect) : rawImage;
+      setImage(out);
+      setCropped(Boolean(rect));
+      setCropping(false);
+    } catch (e) {
+      setErr('裁剪失败：' + e.message);
+    }
+  };
+  const onCropCancel = () => {
+    setCropping(false);
+    setRawImage(null);
+    if (fileRef.current) fileRef.current.value = '';
   };
   const run = useCallback(async () => {
     setLoading(true);
@@ -1678,6 +1912,7 @@ function CapturePage({
 
       // 分析完立刻留档（saved: false 表示「只是分析过，还没加入错题本」）。
       // 这样即使用户看完就走，历史里也有痕迹，不会什么都留不下。
+      // 题图一并存下（裁剪后的那份），方便以后回看当时拍的是什么。
       const archived = create({
         module: a.module || module,
         topic: a.topic || '',
@@ -1689,15 +1924,20 @@ function CapturePage({
         source: mode === 'photo' ? 'photo' : 'text',
         userNote,
         saved: false,
-        packId: packId || null
+        packId: packId || null,
+        image: mode === 'photo' ? image : null
       });
       setDraftId(archived.id);
+      if (mode === 'photo' && image) {
+        // 清掉更早的未收藏题图，控制占用（已收藏的永久保留）
+        pruneUnsavedImages([archived, ...records]).catch(() => {});
+      }
     } catch (e) {
       setErr(e.message);
     } finally {
       setLoading(false);
     }
-  }, [settings, mode, image, questionText, module, userAnswer, correctAnswer, userNote, create, packId]);
+  }, [settings, mode, image, questionText, module, userAnswer, correctAnswer, userNote, create, packId, records]);
 
   /** 加入错题本：把已经留档的那条改成 saved，而不是又插一条新的 */
   const save = () => {
@@ -1762,28 +2002,48 @@ function CapturePage({
     key: t.k,
     onClick: () => setMode(t.k),
     className: 'flex-1 rounded-lg py-2 text-sm font-medium transition ' + (mode === t.k ? 'bg-white text-brand-700 shadow-sm' : 'text-slate-500')
-  }, t.label))), mode === 'photo' ? /*#__PURE__*/React.createElement(Card, {
+  }, t.label))), mode === 'photo' ? cropping ? /*#__PURE__*/React.createElement(Card, {
+    className: "p-4"
+  }, /*#__PURE__*/React.createElement(CropEditor, {
+    src: rawImage,
+    onConfirm: onCropConfirm,
+    onCancel: onCropCancel
+  })) : /*#__PURE__*/React.createElement(Card, {
     className: "p-4"
   }, /*#__PURE__*/React.createElement("input", {
     ref: fileRef,
     type: "file",
     accept: "image/*",
-    capture: "environment",
     onChange: onPickFile,
     className: "hidden"
   }), image ? /*#__PURE__*/React.createElement("div", {
     className: "space-y-3"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "relative"
   }, /*#__PURE__*/React.createElement("img", {
     src: image,
     alt: "\u9898\u76EE",
     className: "max-h-72 w-full rounded-xl object-contain bg-slate-50"
-  }), /*#__PURE__*/React.createElement("div", {
+  }), cropped && /*#__PURE__*/React.createElement("span", {
+    className: "absolute left-2 top-2 rounded bg-emerald-600/90 px-2 py-0.5 text-[11px] font-medium text-white"
+  }, "\u2702\uFE0F \u5DF2\u88C1\u526A")), /*#__PURE__*/React.createElement("div", {
     className: "flex gap-2"
   }, /*#__PURE__*/React.createElement("button", {
     onClick: () => fileRef.current?.click(),
     className: "flex-1 rounded-xl bg-slate-100 py-2.5 text-sm font-medium text-slate-700"
-  }, "\u91CD\u65B0\u62CD\u7167"), /*#__PURE__*/React.createElement("button", {
-    onClick: () => setImage(null),
+  }, "\u91CD\u65B0\u9009\u56FE"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => {
+      // 回到裁剪步骤，原图还在
+      setCropping(true);
+      setAnalysis(null);
+      setSavedId(null);
+    },
+    className: "flex-1 rounded-xl bg-slate-100 py-2.5 text-sm font-medium text-slate-700"
+  }, cropped ? '重裁' : '裁剪'), /*#__PURE__*/React.createElement("button", {
+    onClick: () => {
+      setImage(null);
+      setCropped(false);
+    },
     className: "flex-1 rounded-xl bg-slate-100 py-2.5 text-sm font-medium text-slate-700"
   }, "\u5220\u9664"))) : /*#__PURE__*/React.createElement("button", {
     onClick: () => fileRef.current?.click(),
@@ -1792,9 +2052,9 @@ function CapturePage({
     className: "text-3xl"
   }, "\uD83D\uDCF7"), /*#__PURE__*/React.createElement("span", {
     className: "font-medium"
-  }, "\u62CD\u7167 / \u4ECE\u76F8\u518C\u9009\u62E9"), /*#__PURE__*/React.createElement("span", {
+  }, "\u62CD\u9898 / \u4ECE\u76F8\u518C\u9009\u56FE"), /*#__PURE__*/React.createElement("span", {
     className: "text-xs text-slate-400"
-  }, "\u4E00\u6B21\u62CD\u4E00\u9053\u9898\uFF0C\u62CD\u6E05\u695A\u9898\u5E72\u548C\u9009\u9879"))) : /*#__PURE__*/React.createElement(Card, {
+  }, "\u62CD\u5B8C\u4F1A\u8BA9\u4F60\u6846\u51FA\u8FD9\u9053\u9898\uFF0C\u907F\u514D\u5206\u6790\u9519"))) : /*#__PURE__*/React.createElement(Card, {
     className: "p-4"
   }, /*#__PURE__*/React.createElement("label", {
     className: "mb-1.5 block text-sm font-medium text-slate-600"
@@ -1998,6 +2258,14 @@ function RecordsPage({
     onClick: () => onOpenDetail(r.id),
     className: "press-flat w-full text-left"
   }, /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-3"
+  }, r.image && /*#__PURE__*/React.createElement("img", {
+    src: r.image,
+    alt: "",
+    className: "h-16 w-16 flex-none rounded-lg border border-slate-200 object-cover"
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "min-w-0 flex-1"
+  }, /*#__PURE__*/React.createElement("div", {
     className: "mb-1.5 flex flex-wrap items-center gap-1.5"
   }, /*#__PURE__*/React.createElement(ModuleChip, {
     module: r.module
@@ -2021,7 +2289,7 @@ function RecordsPage({
   }, r.analysis.error_types.slice(0, 3).map(k => /*#__PURE__*/React.createElement(ErrorChip, {
     key: k,
     errKey: k
-  })))), /*#__PURE__*/React.createElement("div", {
+  })))))), /*#__PURE__*/React.createElement("div", {
     className: "mt-2 flex items-center justify-end gap-3 border-t border-slate-100 pt-2"
   }, !r.saved && /*#__PURE__*/React.createElement("button", {
     onClick: () => {
@@ -2168,7 +2436,8 @@ function DetailPage({
   const {
     records,
     settings,
-    patch
+    patch,
+    showToast
   } = useApp();
   const rec = records.find(r => r.id === id);
   const [thread, setThread] = useState(rec?.chat || []);
@@ -2261,7 +2530,15 @@ function DetailPage({
     day: 'numeric',
     hour: '2-digit',
     minute: '2-digit'
-  }))), rec.analysis ? /*#__PURE__*/React.createElement(AnalysisResult, {
+  }))), rec.image && /*#__PURE__*/React.createElement(RecordImage, {
+    src: rec.image,
+    onDelete: () => {
+      patch(rec.id, {
+        image: null
+      });
+      showToast('已删掉原图');
+    }
+  }), rec.analysis ? /*#__PURE__*/React.createElement(AnalysisResult, {
     analysis: rec.analysis,
     saved: rec.status === 'correct' ? 'mastered' : 'pending',
     showErrorFixes: false
@@ -2785,7 +3062,6 @@ function EssayPage({
     ref: fileRef,
     type: "file",
     accept: "image/*",
-    capture: "environment",
     onChange: onPick,
     className: "hidden"
   }), image ? /*#__PURE__*/React.createElement("div", {

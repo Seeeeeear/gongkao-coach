@@ -1173,6 +1173,56 @@ function compressImage(file, maxSide = 1600, quality = 0.82) {
   })
 }
 
+/**
+ * 按比例裁一块图（矩形用 0~1 的相对坐标，方便和显示尺寸解耦）。
+ * 裁剪后再压缩一次，让传给 AI 的图更小、更干净。
+ */
+function cropDataUrl(dataUrl, rect, quality = 0.86) {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.onerror = () => reject(new Error('图片解析失败'))
+    img.onload = () => {
+      const sx = Math.round(Math.max(0, Math.min(1, rect.x)) * img.width)
+      const sy = Math.round(Math.max(0, Math.min(1, rect.y)) * img.height)
+      const sw = Math.max(8, Math.round(Math.max(0.02, Math.min(1, rect.w)) * img.width))
+      const sh = Math.max(8, Math.round(Math.max(0.02, Math.min(1, rect.h)) * img.height))
+      const canvas = document.createElement('canvas')
+      canvas.width = Math.min(sw, img.width - sx)
+      canvas.height = Math.min(sh, img.height - sy)
+      const ctx = canvas.getContext('2d')
+      ctx.fillStyle = '#fff'
+      ctx.fillRect(0, 0, canvas.width, canvas.height)
+      ctx.drawImage(img, sx, sy, canvas.width, canvas.height, 0, 0, canvas.width, canvas.height)
+      resolve(canvas.toDataURL('image/jpeg', quality))
+    }
+    img.src = dataUrl
+  })
+}
+
+/**
+ * 清理没收藏的记录里的题图，控制存储占用。
+ *
+ * 规则（用户定的）：
+ *   - 已加入错题本的题：原图永久保留，只有用户主动删除才消失
+ *   - 只是分析过、没收藏的：只留最近 maxKeep 张，更早的清掉
+ *
+ * 注意：同时清掉记录里的 image 和 draftImage 两个字段
+ * （draftImage 是拍完还没分析时暂存的，防止中途退出留下垃圾）。
+ */
+async function pruneUnsavedImages(records, maxKeep = 100) {
+  const targets = records
+    .filter((r) => !r.saved && (r.image || r.draftImage))
+    .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+  if (targets.length <= maxKeep) return 0
+  const drop = targets.slice(maxKeep)
+  for (const r of drop) {
+    r.image = null
+    r.draftImage = null
+    await dbPutRecord(r)
+  }
+  return drop.length
+}
+
 /* ==========================================================================
  * §5 示例数据 —— 不配 API Key 也能看到分析长什么样
  * 用途：① 新用户先看效果，决定值不值得用 ② 开发者调界面时不用烧 token
@@ -1668,8 +1718,191 @@ function AnalysisResult({ analysis, onSave, saving, saved, showErrorFixes = true
   )
 }
 
+/**
+ * 裁剪界面。
+ *
+ * 为什么必须有：拍一张照片常常框进好几道题，AI 会分析错那道；而且多余部分
+ * 会让图变大、识别变慢。让用户框出"就是这一道"，是最直接的解法。
+ *
+ * 交互设计（按手机操作习惯）：
+ *   - 手指在图上拖，直接拉出一个框
+ *   - 松手后可再拖重新框（不用先清除）
+ *   - 不给四角手柄 —— 手机上太细，点不准；重拖一次更快
+ *   - 没框选时默认用整张图（不强迫裁剪）
+ *   - 显示实时百分比，让用户知道自己框了多大
+ */
+function CropEditor({ src, onConfirm, onCancel, busy }) {
+  const [rect, setRect] = useState(null) // {x,y,w,h} 相对坐标 0~1
+  const [dragging, setDragging] = useState(null)
+  const boxRef = useRef(null)
+
+  /** 把指针位置换算成图片内的相对坐标 */
+  const toRelative = (clientX, clientY) => {
+    const el = boxRef.current
+    if (!el) return { x: 0, y: 0 }
+    const b = el.getBoundingClientRect()
+    return {
+      x: Math.max(0, Math.min(1, (clientX - b.left) / b.width)),
+      y: Math.max(0, Math.min(1, (clientY - b.top) / b.height)),
+    }
+  }
+
+  const onDown = (e) => {
+    if (busy) return
+    const p = toRelative(e.clientX, e.clientY)
+    setDragging({ sx: p.x, sy: p.y })
+    setRect(null)
+  }
+
+  const onMove = (e) => {
+    if (!dragging || busy) return
+    // 阻止拖动时页面跟着滚
+    if (e.cancelable) e.preventDefault()
+    const p = toRelative(e.clientX, e.clientY)
+    setRect({
+      x: Math.min(dragging.sx, p.x),
+      y: Math.min(dragging.sy, p.y),
+      w: Math.abs(p.x - dragging.sx),
+      h: Math.abs(p.y - dragging.sy),
+    })
+  }
+
+  const onUp = () => setDragging(null)
+
+  // 框太小就当作没框（避免误触产生一个 2px 的框导致裁出废图）
+  const usable = rect && rect.w > 0.05 && rect.h > 0.05
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-start gap-2 rounded-xl bg-brand-50 p-3 text-sm text-brand-800">
+        <span>✂️</span>
+        <div>
+          <b>框出你要分析的那道题</b>
+          <div className="mt-0.5 text-xs text-brand-700/80">
+            用手指在图上拖一个框。框得准，AI 就不会分析错题，识别也更快。
+          </div>
+        </div>
+      </div>
+
+      <div
+        ref={boxRef}
+        onPointerDown={(e) => onDown(e)}
+        onPointerMove={(e) => onMove(e)}
+        onPointerUp={onUp}
+        onPointerCancel={onUp}
+        onPointerLeave={onUp}
+        className="relative select-none overflow-hidden rounded-xl bg-slate-900"
+        style={{ touchAction: 'none', cursor: 'crosshair' }}
+      >
+        <img src={src} alt="待裁剪" className="block w-full" draggable={false} />
+
+        {/* 未选框时铺一层淡色提示，让用户知道这里可以拖 */}
+        {!usable && (
+          <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-slate-900/25">
+            <span className="rounded-full bg-slate-900/70 px-3 py-1.5 text-xs text-white">
+              手指在图上拖动，框出这道题
+            </span>
+          </div>
+        )}
+
+        {/* 选框：框内不提亮，框外加暗色遮罩，突出被选区域 */}
+        {usable && (
+          <>
+            <div
+              className="pointer-events-none absolute border-2 border-brand-400"
+              style={{
+                left: `${rect.x * 100}%`,
+                top: `${rect.y * 100}%`,
+                width: `${rect.w * 100}%`,
+                height: `${rect.h * 100}%`,
+                boxShadow: '0 0 0 9999px rgba(15,23,42,0.55)',
+              }}
+            />
+            <div
+              className="pointer-events-none absolute rounded bg-brand-600 px-1.5 py-0.5 text-[10px] font-medium text-white"
+              style={{
+                left: `${rect.x * 100}%`,
+                top: `${rect.y * 100}%`,
+                transform: 'translateY(-100%)',
+              }}
+            >
+              已选 {Math.round(rect.w * 100)}% × {Math.round(rect.h * 100)}%
+            </div>
+          </>
+        )}
+      </div>
+
+      <div className="flex gap-2">
+        {usable && (
+          <button
+            onClick={() => setRect(null)}
+            disabled={busy}
+            className="flex-1 rounded-xl bg-slate-100 py-3 text-sm font-medium text-slate-700"
+          >
+            重新框选
+          </button>
+        )}
+        <button
+          onClick={onCancel}
+          disabled={busy}
+          className="flex-1 rounded-xl bg-slate-100 py-3 text-sm font-medium text-slate-700"
+        >
+          取消
+        </button>
+      </div>
+
+      <PrimaryButton
+        onClick={() => onConfirm(usable ? rect : null)}
+        loading={busy}
+      >
+        {usable ? '就用这块，开始分析' : '不裁了，用整张图'}
+      </PrimaryButton>
+    </div>
+  )
+}
+
+/**
+ * 记录里的题图。
+ * 默认收起（不占屏幕），点开看原题。已收藏的题原图永久保留，
+ * 所以给一个「删掉原图」的出口 —— 永久保留指的是"不自动清理"，不是"删不掉"。
+ */
+function RecordImage({ src, onDelete }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <Card className="p-3.5">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="press-flat flex w-full items-center gap-2 text-left"
+      >
+        <span className="text-base leading-none">🖼</span>
+        <span className="flex-1 text-sm font-medium text-slate-600">
+          {open ? '收起原题图片' : '查看原题图片'}
+        </span>
+        <span className="text-xs text-slate-400">{open ? '▾' : '▸'}</span>
+      </button>
+      {open && (
+        <div className="mt-3 space-y-2">
+          <img src={src} alt="原题" className="w-full rounded-xl bg-slate-50" />
+          {onDelete && (
+            <button
+              onClick={() => {
+                if (confirm('删掉这张原题图片？文字分析会保留，只是以后看不到原图了。')) {
+                  onDelete()
+                }
+              }}
+              className="w-full rounded-xl bg-slate-100 py-2 text-xs font-medium text-slate-500"
+            >
+              删掉原图（文字分析保留）
+            </button>
+          )}
+        </div>
+      )}
+    </Card>
+  )
+}
+
 function CapturePage({ onOpenDetail, gotoEssay }) {
-  const { settings, create, patch, showToast } = useApp()
+  const { settings, create, patch, showToast, records } = useApp()
   const [mode, setMode] = useState('photo')
   const [image, setImage] = useState(null)
   const [questionText, setQuestionText] = useState('')
@@ -1685,6 +1918,10 @@ function CapturePage({ onOpenDetail, gotoEssay }) {
   const [savedId, setSavedId] = useState(null)
   // 分析完自动留档产生的那条记录 id（加入错题本时复用它，避免重复入库）
   const [draftId, setDraftId] = useState(null)
+  // 裁剪阶段：rawImage 是刚从相册/相机拿到的图，还没裁剪
+  const [rawImage, setRawImage] = useState(null)
+  const [cropping, setCropping] = useState(false)
+  const [cropped, setCropped] = useState(false)
   const fileRef = useRef(null)
 
   const onPickFile = async (e) => {
@@ -1693,12 +1930,37 @@ function CapturePage({ onOpenDetail, gotoEssay }) {
     setErr('')
     try {
       const dataUrl = await compressImage(file)
-      setImage(dataUrl)
+      // 不直接拿去分析，先进裁剪阶段 —— 让用户框出"就是这一道"
+      setRawImage(dataUrl)
+      setCropping(true)
+      setImage(null)
+      setCropped(false)
       setAnalysis(null)
       setSavedId(null)
+      setDraftId(null)
     } catch (e2) {
       setErr(e2.message)
     }
+  }
+
+  /** 裁剪确认：rect 为 null 表示用整张图 */
+  const onCropConfirm = async (rect) => {
+    if (!rawImage) return
+    setErr('')
+    try {
+      const out = rect ? await cropDataUrl(rawImage, rect) : rawImage
+      setImage(out)
+      setCropped(Boolean(rect))
+      setCropping(false)
+    } catch (e) {
+      setErr('裁剪失败：' + e.message)
+    }
+  }
+
+  const onCropCancel = () => {
+    setCropping(false)
+    setRawImage(null)
+    if (fileRef.current) fileRef.current.value = ''
   }
 
   const run = useCallback(async () => {
@@ -1733,6 +1995,7 @@ function CapturePage({ onOpenDetail, gotoEssay }) {
 
       // 分析完立刻留档（saved: false 表示「只是分析过，还没加入错题本」）。
       // 这样即使用户看完就走，历史里也有痕迹，不会什么都留不下。
+      // 题图一并存下（裁剪后的那份），方便以后回看当时拍的是什么。
       const archived = create({
         module: a.module || module,
         topic: a.topic || '',
@@ -1745,14 +2008,19 @@ function CapturePage({ onOpenDetail, gotoEssay }) {
         userNote,
         saved: false,
         packId: packId || null,
+        image: mode === 'photo' ? image : null,
       })
       setDraftId(archived.id)
+      if (mode === 'photo' && image) {
+        // 清掉更早的未收藏题图，控制占用（已收藏的永久保留）
+        pruneUnsavedImages([archived, ...records]).catch(() => {})
+      }
     } catch (e) {
       setErr(e.message)
     } finally {
       setLoading(false)
     }
-  }, [settings, mode, image, questionText, module, userAnswer, correctAnswer, userNote, create, packId])
+  }, [settings, mode, image, questionText, module, userAnswer, correctAnswer, userNote, create, packId, records])
 
   /** 加入错题本：把已经留档的那条改成 saved，而不是又插一条新的 */
   const save = () => {
@@ -1827,31 +2095,67 @@ function CapturePage({ onOpenDetail, gotoEssay }) {
       </div>
 
       {mode === 'photo' ? (
-        <Card className="p-4">
-          <input ref={fileRef} type="file" accept="image/*" capture="environment" onChange={onPickFile} className="hidden" />
-          {image ? (
-            <div className="space-y-3">
-              <img src={image} alt="题目" className="max-h-72 w-full rounded-xl object-contain bg-slate-50" />
-              <div className="flex gap-2">
-                <button onClick={() => fileRef.current?.click()} className="flex-1 rounded-xl bg-slate-100 py-2.5 text-sm font-medium text-slate-700">
-                  重新拍照
-                </button>
-                <button onClick={() => setImage(null)} className="flex-1 rounded-xl bg-slate-100 py-2.5 text-sm font-medium text-slate-700">
-                  删除
-                </button>
+        cropping ? (
+          <Card className="p-4">
+            <CropEditor src={rawImage} onConfirm={onCropConfirm} onCancel={onCropCancel} />
+          </Card>
+        ) : (
+          <Card className="p-4">
+            {/*
+              注意：这里**故意不加 capture="environment"**。
+              加了它，浏览器会强制调起相机并把照片存进系统相册，
+              而网页无权删除相册里的照片 —— 用户的相册会被拍题照片污染。
+              不加它则弹出"拍照 / 从相册选"选择器，照片不落相册。
+            */}
+            <input ref={fileRef} type="file" accept="image/*" onChange={onPickFile} className="hidden" />
+            {image ? (
+              <div className="space-y-3">
+                <div className="relative">
+                  <img src={image} alt="题目" className="max-h-72 w-full rounded-xl object-contain bg-slate-50" />
+                  {cropped && (
+                    <span className="absolute left-2 top-2 rounded bg-emerald-600/90 px-2 py-0.5 text-[11px] font-medium text-white">
+                      ✂️ 已裁剪
+                    </span>
+                  )}
+                </div>
+                <div className="flex gap-2">
+                  <button onClick={() => fileRef.current?.click()} className="flex-1 rounded-xl bg-slate-100 py-2.5 text-sm font-medium text-slate-700">
+                    重新选图
+                  </button>
+                  <button
+                    onClick={() => {
+                      // 回到裁剪步骤，原图还在
+                      setCropping(true)
+                      setAnalysis(null)
+                      setSavedId(null)
+                    }}
+                    className="flex-1 rounded-xl bg-slate-100 py-2.5 text-sm font-medium text-slate-700"
+                  >
+                    {cropped ? '重裁' : '裁剪'}
+                  </button>
+                  <button
+                    onClick={() => {
+                      setImage(null)
+                      setCropped(false)
+                    }}
+                    className="flex-1 rounded-xl bg-slate-100 py-2.5 text-sm font-medium text-slate-700"
+                  >
+                    删除
+                  </button>
+                </div>
               </div>
-            </div>
-          ) : (
-            <button
-              onClick={() => fileRef.current?.click()}
-              className="flex w-full flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed border-slate-300 py-12 text-slate-500 transition active:bg-slate-50"
-            >
-              <span className="text-3xl">📷</span>
-              <span className="font-medium">拍照 / 从相册选择</span>
-              <span className="text-xs text-slate-400">一次拍一道题，拍清楚题干和选项</span>
-            </button>
-          )}
-        </Card>
+            ) : (
+              <button
+                onClick={() => fileRef.current?.click()}
+                className="flex w-full flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed border-slate-300 py-12 text-slate-500 transition active:bg-slate-50"
+              >
+                <span className="text-3xl">📷</span>
+                <span className="font-medium">拍题 / 从相册选图</span>
+                <span className="text-xs text-slate-400">拍完会让你框出这道题，避免分析错</span>
+              </button>
+            )}
+          </Card>
+        )
       ) : (
         <Card className="p-4">
           <label className="mb-1.5 block text-sm font-medium text-slate-600">粘贴题目（含选项更好）</label>
@@ -2108,31 +2412,43 @@ function RecordsPage({ onOpenDetail }) {
             {list.map((r) => (
               <Card key={r.id} className="p-3.5">
                 <button onClick={() => onOpenDetail(r.id)} className="press-flat w-full text-left">
-                  <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
-                    <ModuleChip module={r.module} />
-                    {r.topic && <Chip className="border-slate-200 bg-slate-50 text-slate-600">{r.topic}</Chip>}
-                    {r.saved ? (
-                      <Chip className="border-brand-200 bg-brand-50 text-brand-700">📌 错题本</Chip>
-                    ) : (
-                      <Chip className="border-slate-200 bg-white text-slate-400">未收藏</Chip>
+                  <div className="flex gap-3">
+                    {/* 缩略图：有原图的记录一眼能认出来，比读文字快 */}
+                    {r.image && (
+                      <img
+                        src={r.image}
+                        alt=""
+                        className="h-16 w-16 flex-none rounded-lg border border-slate-200 object-cover"
+                      />
                     )}
-                    {r.status === 'correct' && (
-                      <Chip className="border-emerald-200 bg-emerald-50 text-emerald-700">🎓 已掌握</Chip>
-                    )}
-                    <span className="ml-auto text-[11px] text-slate-400">
-                      {new Date(r.createdAt).toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' })}
-                    </span>
-                  </div>
-                  <div className="line-clamp-2 text-sm text-slate-700">
-                    {r.analysis?.error_summary || r.questionText?.slice(0, 60) || '（无题干）'}
-                  </div>
-                  {r.analysis?.error_types?.length > 0 && (
-                    <div className="mt-2 flex flex-wrap gap-1">
-                      {r.analysis.error_types.slice(0, 3).map((k) => (
-                        <ErrorChip key={k} errKey={k} />
-                      ))}
+                    <div className="min-w-0 flex-1">
+                      <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
+                        <ModuleChip module={r.module} />
+                        {r.topic && <Chip className="border-slate-200 bg-slate-50 text-slate-600">{r.topic}</Chip>}
+                        {r.saved ? (
+                          <Chip className="border-brand-200 bg-brand-50 text-brand-700">📌 错题本</Chip>
+                        ) : (
+                          <Chip className="border-slate-200 bg-white text-slate-400">未收藏</Chip>
+                        )}
+                        {r.status === 'correct' && (
+                          <Chip className="border-emerald-200 bg-emerald-50 text-emerald-700">🎓 已掌握</Chip>
+                        )}
+                        <span className="ml-auto text-[11px] text-slate-400">
+                          {new Date(r.createdAt).toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' })}
+                        </span>
+                      </div>
+                      <div className="line-clamp-2 text-sm text-slate-700">
+                        {r.analysis?.error_summary || r.questionText?.slice(0, 60) || '（无题干）'}
+                      </div>
+                      {r.analysis?.error_types?.length > 0 && (
+                        <div className="mt-2 flex flex-wrap gap-1">
+                          {r.analysis.error_types.slice(0, 3).map((k) => (
+                            <ErrorChip key={k} errKey={k} />
+                          ))}
+                        </div>
+                      )}
                     </div>
-                  )}
+                  </div>
                 </button>
 
                 <div className="mt-2 flex items-center justify-end gap-3 border-t border-slate-100 pt-2">
@@ -2331,7 +2647,7 @@ function RedoBlock({ analysis, onRedo }) {
 }
 
 function DetailPage({ id, onBack }) {
-  const { records, settings, patch } = useApp()
+  const { records, settings, patch, showToast } = useApp()
   const rec = records.find((r) => r.id === id)
   const [thread, setThread] = useState(rec?.chat || [])
   const [q, setQ] = useState('')
@@ -2407,6 +2723,17 @@ function DetailPage({ id, onBack }) {
           {new Date(rec.createdAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
         </span>
       </div>
+
+      {/* 当时拍的那道题：默认收起，点开看。这样既能看到原题，也不占屏幕 */}
+      {rec.image && (
+        <RecordImage
+          src={rec.image}
+          onDelete={() => {
+            patch(rec.id, { image: null })
+            showToast('已删掉原图')
+          }}
+        />
+      )}
 
       {rec.analysis ? (
         <AnalysisResult
@@ -2943,7 +3270,8 @@ function EssayPage({ onBack }) {
 
       {mode === 'photo' && (
         <Card className="p-4">
-          <input ref={fileRef} type="file" accept="image/*" capture="environment" onChange={onPick} className="hidden" />
+          {/* 同样不加 capture：避免手写稿照片被塞进系统相册 */}
+          <input ref={fileRef} type="file" accept="image/*" onChange={onPick} className="hidden" />
           {image ? (
             <div className="space-y-3">
               <img src={image} alt="作答" className="max-h-80 w-full rounded-xl object-contain bg-slate-50" />
